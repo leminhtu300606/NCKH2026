@@ -1,17 +1,42 @@
 # BÁO CÁO ĐỀ XUẤT HƯỚNG NGHIÊN CỨU
 
 ## Đề tài: Nghiên cứu, phát triển hệ thống giám sát video thời gian thực bảo vệ quyền riêng tư trên thiết bị biên nhúng cho UAV
+1. Tổng quan đề tài
+1.1 Khoảng trống nghiên cứu đề xuất
+Tôi đề xuất tập trung vào một khoảng trống chính và ba khoảng trống hỗ trợ.
 
-## 1. Tổng quan đề tài
+Khoảng trống chính: Chưa có cơ chế bảo vệ thích ứng được đánh giá đầy đủ trên toàn pipeline UAV
 
-### 1.1. Bối cảnh nghiên cứu
+Nhiều hướng nghiên cứu tập trung vào phát hiện khuôn mặt, ẩn danh hình ảnh hoặc xử lý video tại edge. Vấn đề cần khảo sát là liệu việc kết hợp đánh giá rủi ro theo ngữ cảnh, chính sách ẩn danh thích ứng và kiểm tra đầu ra có cải thiện được cân bằng giữa quyền riêng tư, độ trễ và tài nguyên hay không.
 
-UAV (Unmanned Aerial Vehicle) được sử dụng trong các nhiệm vụ giám sát, quan sát và thu thập dữ liệu hình ảnh từ môi trường thực tế. Video thu được có thể chứa thông tin nhận dạng cá nhân, chẳng hạn như khuôn mặt và biển số phương tiện. Việc lưu trữ hoặc truyền tải video chưa được bảo vệ có thể dẫn đến nguy cơ tiết lộ thông tin riêng tư.
+Câu hỏi nghiên cứu: So với ẩn danh cố định, chính sách thích ứng có giảm khả năng nhận dạng danh tính hoặc giảm chi phí tính toán mà vẫn duy trì mức bảo vệ tương đương không?
 
-Một phương pháp bảo vệ quyền riêng tư là ẩn danh các vùng hình ảnh chứa thông tin nhạy cảm trước khi video được xuất hoặc truyền đi. Tuy nhiên, trong hệ thống giám sát UAV, quá trình xử lý cần đáp ứng yêu cầu thời gian thực và giới hạn tài nguyên tính toán của thiết bị biên nhúng.
 
-Nếu áp dụng một mức ẩn danh cố định cho mọi đối tượng và mọi tình huống, hệ thống sẽ không phân biệt được sự khác nhau về mức độ rủi ro riêng tư giữa các ngữ cảnh quan sát. Vì vậy, nghiên cứu tập trung vào việc đánh giá rủi ro quyền riêng tư theo ngữ cảnh và sử dụng kết quả đánh giá để lựa chọn mức độ ẩn danh phù hợp.
 
+
+Khoảng trống 2: Quan hệ giữa tần suất phát hiện, tracking và rò rỉ quyền riêng tư
+
+Giảm tần suất chạy detector có thể tăng thông lượng xử lý, nhưng có thể bỏ lỡ đối tượng xuất hiện ngắn hoặc làm vùng tracking lệch khỏi đối tượng thật. Cần đo trực tiếp ảnh hưởng của chu kỳ phát hiện đến độ bao phủ đối tượng nhạy cảm và hiệu quả ẩn danh trên toàn video.
+
+Câu hỏi nghiên cứu: Có thể điều chỉnh tần suất phát hiện dựa trên độ tin cậy tracking và mức bất định để giảm thời gian xử lý mà không làm tăng đáng kể tỷ lệ bỏ sót hay không?
+
+
+
+
+Khoảng trống 3: Xử lý an toàn khi detector hoặc tracker không chắc chắn
+
+Một hệ thống có thể mất dấu đối tượng, phát hiện thiếu hoặc đưa ra bounding box không chính xác. Nếu pipeline vẫn truyền frame như bình thường, hệ thống có thể để lộ thông tin nhạy cảm.
+
+Câu hỏi nghiên cứu: Cơ chế kiểm tra trước khi xuất frame và chính sách dự phòng bảo thủ có giảm số frame rò rỉ trong các tình huống khó mà vẫn duy trì độ trễ chấp nhận được không?
+
+
+
+
+Khoảng trống 4: Thiếu đánh giá đồng thời quyền riêng tư và hiệu năng thiết bị biên
+
+FPS cao không đồng nghĩa với bảo vệ tốt. Chỉ số mAP hoặc HOTA cũng không phản ánh trực tiếp danh tính còn có thể nhận dạng sau ẩn danh hay không.
+
+Câu hỏi nghiên cứu: Có thể xây dựng quy trình đánh giá thống nhất bao gồm hiệu quả ẩn danh, tỷ lệ bỏ sót đối tượng nhạy cảm, độ trễ đầu cuối, FPS và năng lượng tiêu thụ hay không?
 ### 1.2. Vấn đề nghiên cứu
 
 Đề tài tập trung giải quyết ba vấn đề chính:
