@@ -1,0 +1,42 @@
+# LightGBM risk estimator configuration
+
+model:
+  type: "lightgbm"
+  objective: "binary"
+  metric: "auc"
+  num_leaves: 31
+  learning_rate: 0.05
+  n_estimators: 500
+  min_child_samples: 20
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_alpha: 0.1
+  reg_lambda: 1.0
+  seed: 42
+
+features:
+  num_features: 21
+  groups:
+    confidence: ["conf_current", "conf_std_5f", "conf_delta"]
+    tracker: ["track_age", "hit_ratio", "stale_duration", "tracker_state"]
+    bbox_geometry: ["min_side", "aspect_deviation", "edge_distance", "truncation"]
+    motion: ["norm_center_speed", "kalman_uncertainty"]
+    image_quality: ["laplacian_var", "brightness", "sharpness_ratio"]
+    local_context: ["nn_distance", "density", "max_pairwise_iou"]
+    frame_context: ["det_count_change", "count_vs_historical"]
+
+  aggregation:
+    methods: ["mean", "std", "min", "max", "current"]
+    window: 5   # frames
+
+thresholds:
+  operating_point: 0.5
+  p0_upper: 0.20
+  p1_upper: 0.45
+  p2_upper: 0.70
+
+export:
+  format: "onnx"      # onnx | treelite
+  model_path: "/kaggle/working/artifacts/risk_model/model.txt"
+  onnx_path: "/kaggle/working/artifacts/risk_model/model.onnx"
+

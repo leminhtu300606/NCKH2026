@@ -1,0 +1,37 @@
+# Policy dispatcher P0-P3 configuration
+
+policy:
+  levels:
+    P0:
+      risk_range: [0.0, 0.20]
+      action: "baseline_anonymize"
+      bbox_padding: 0.0
+      mask_strength: "light"
+    P1:
+      risk_range: [0.20, 0.45]
+      action: "enhanced_mask"
+      bbox_padding: 0.10
+      mask_strength: "medium"
+    P2:
+      risk_range: [0.45, 0.70]
+      action: "strong_mask_redetect"
+      bbox_padding: 0.20
+      mask_strength: "heavy"
+    P3:
+      risk_range: [0.70, 1.0]
+      action: "max_mask_or_drop"
+      bbox_padding: 0.30
+      mask_strength: "maximum"
+
+  hysteresis:
+    enabled: true
+    downgrade_threshold_offset: 0.05   # e.g. P1->P0 needs p < 0.15
+    downgrade_stable_count: 10         # stable for N evaluations
+    upgrade_consecutive_count: 2       # N consecutive evaluations above threshold
+    immediate_p3_threshold: 0.70       # any failure -> P3 immediately
+
+  anonymizer:
+    methods: ["gaussian_blur", "mosaic", "pixelation"]
+    default_method: "gaussian_blur"
+    fallback_method: "mosaic"          # if primary fails
+

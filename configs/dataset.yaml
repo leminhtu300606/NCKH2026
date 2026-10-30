@@ -1,0 +1,35 @@
+# Dataset configuration
+# Paths are for Kaggle runtime; override for local dev
+
+datasets:
+  license_plate_10k:
+    name: "License-Plate-10K"
+    kaggle_slug: "mtu2006/license-plate-10k"
+    root: "/kaggle/input/license-plate-10k"
+    type: "detection"  # detection | tracking | reid
+    description: "10K images with license plate bounding box annotations"
+
+  birdseye_ru:
+    name: "Birdseye-RU"
+    kaggle_slug: "mdahanafarifkhan/birdseye-ru"
+    root: "/kaggle/input/birdseye-ru"
+    type: "detection"
+    description: "UAV bird-eye view dataset with person annotations"
+
+output:
+  interim_dir: "/kaggle/working/data/interim"
+  processed_dir: "/kaggle/working/data/processed"
+  manifests_dir: "/kaggle/working/data/manifests"
+
+splits:
+  method: "by_identity"    # by_identity | by_sequence | random
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+
+coco_output:
+  license_plate: "/kaggle/working/data/interim/coco_license_plate.json"
+  birdseye_ru: "/kaggle/working/data/interim/coco_birdseye_ru.json"
+  merged: "/kaggle/working/data/interim/coco_merged.json"
+

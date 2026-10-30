@@ -1,0 +1,60 @@
+# Person detector configuration
+
+model:
+  architecture: "yolov8n"       # yolov8n | yolo11n | yolo26n
+  num_classes: 1                # single-class: person
+  pretrained: true              # start from COCO pretrained
+  input_size: 640               # image size
+
+training:
+  epochs: 30
+  batch_size: 16
+  optimizer: "AdamW"
+  lr0: 0.01
+  lrf: 0.01                    # final LR ratio
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  patience: 10                  # early stopping patience
+  device: "0"                   # GPU id or "cpu"
+  seed: 42
+  workers: 4
+
+augmentation:
+  mosaic: 1.0
+  mixup: 0.15
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  fliplr: 0.5
+  erasing: 0.4
+
+inference:
+  conf_threshold: 0.01         # low threshold for high recall (privacy)
+  iou_threshold: 0.7           # NMS IoU threshold
+  max_det: 300
+
+export:
+  format: "onnx"               # onnx | tensorrt | openvino
+  simplify: true
+  dynamic: false
+  half: false                  # FP16
+
+targets:
+  map50: 0.80                  # mAP@0.5 >= 80%
+  recall: 0.75                 # recall >= 75%
+  model_size_mb: 10            # <= 10 MB
+  edge_fps: 25                 # >= 25 FPS after optimization
+
+paths:
+  train_data: "/kaggle/working/data/processed/yolo_train"
+  val_data: "/kaggle/working/data/processed/yolo_val"
+  test_data: "/kaggle/working/data/processed/yolo_test"
+  checkpoint_dir: "/kaggle/working/artifacts/detector"
+  best_pt: "/kaggle/working/artifacts/detector/best.pt"
+  best_onnx: "/kaggle/working/artifacts/detector/best.onnx"
+  eval_report: "/kaggle/working/reports/detector_eval.md"
+

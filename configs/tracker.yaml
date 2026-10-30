@@ -1,0 +1,16 @@
+# ByteTrack tracker configuration
+
+tracker:
+  type: "bytetrack"
+  track_high_thresh: 0.5        # high confidence detection threshold
+  track_low_thresh: 0.1         # low confidence detection threshold
+  new_track_thresh: 0.6         # threshold to create new track
+  track_buffer: 30              # frames to keep lost tracks
+  match_thresh: 0.8             # IoU matching threshold
+  min_box_area: 10              # minimum bbox area
+  frame_rate: 30                # expected FPS
+
+kalman:
+  std_weight_position: 1.0/20
+  std_weight_velocity: 1.0/160
+

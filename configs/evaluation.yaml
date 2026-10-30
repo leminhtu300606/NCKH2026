@@ -1,0 +1,55 @@
+# Evaluation harness configuration (M0-M5)
+
+ablation:
+  M0:
+    name: "No anonymization"
+    anonymize: false
+    adaptive: false
+    hysteresis: false
+    gate: false
+  M1:
+    name: "Light fixed blur"
+    anonymize: true
+    method: "gaussian_blur"
+    strength: "light"
+    adaptive: false
+    hysteresis: false
+    gate: false
+  M2:
+    name: "Strong fixed blur+mosaic"
+    anonymize: true
+    method: "mosaic"
+    strength: "heavy"
+    adaptive: false
+    hysteresis: false
+    gate: false
+  M3:
+    name: "Adaptive, no hysteresis"
+    anonymize: true
+    adaptive: true
+    hysteresis: false
+    gate: false
+  M4:
+    name: "Adaptive + hysteresis, no gate"
+    anonymize: true
+    adaptive: true
+    hysteresis: true
+    gate: false
+  M5:
+    name: "Full system"
+    anonymize: true
+    adaptive: true
+    hysteresis: true
+    gate: true
+
+metrics:
+  privacy: ["asr", "rank1_reid", "unprotected_frame_rate"]
+  risk_model: ["roc_auc", "pr_auc", "precision", "recall", "f1", "brier_score"]
+  tracking: ["mAP", "idf1", "hota"]
+  edge: ["p50_latency_ms", "p95_latency_ms", "fps", "peak_ram_mb", "energy_per_frame"]
+  safety: ["unprotected_frame_rate", "drop_rate", "re_anonymization_rate"]
+
+output:
+  report_dir: "/kaggle/working/reports"
+  ablation_report: "/kaggle/working/reports/ablation_M0_M5.md"
+
