@@ -48,7 +48,7 @@ OUT_VIDEO = Path("outputs/protected_video.mp4")
 OUT_GATE_LOG = Path("results/output_gate_log.json")
 OUT_METRICS = Path("results/system_metrics_unified.csv")
 COORDINATOR_RULES = Path("config/coordinator_rules.json")
-TAU_PATH = Path("zip_extract/artifacts/tau.json")
+TAU_PATH = Path("zip_extract_full/artifacts/tau.json")
 
 FEATURES = [
     "conf", "conf_std5", "conf_delta", "track_age", "hit_ratio",
@@ -60,6 +60,10 @@ FEATURES = [
 ]
 
 IMG_SIZE = 640
+# Ghi video ra file là tùy chọn: tắt mặc định để tránh lỗi FFmpeg
+# "Failed to write frame" trên môi trường không có encoder tương thích.
+# Metrics (PSNR/SSIM) vẫn được tính trên frame đã che trong bộ nhớ.
+WRITE_VIDEO = False
 CONF_THRES = 0.15
 IOU_THRES = 0.5
 MAX_FRAMES_PER_SEQ = 200
@@ -87,13 +91,22 @@ def load_tau() -> float:
 
 
 def load_risk_model() -> Any:
+    """Tải model calibration nếu hợp lệ, ngược lại fallback về XGBoost thô.
+
+    File `models/xgboost_risk_calibrated.joblib` trong artifact có thể bị hỏng
+    (joblib báo "input stream corrupted"). Trường hợp đó chỉ ghi cảnh báo ngắn
+    gọn và dùng `models/xgboost_risk.json`.
+    """
     if RISK_CALIBRATED_PATH.exists() and _HAS_JOBLIB:
         try:
             cal = joblib.load(str(RISK_CALIBRATED_PATH))
             print(f"[Bước 5] Đã tải mô hình đã calibration: {RISK_CALIBRATED_PATH}")
             return cal
-        except Exception as e:
-            print(f"[Bước 5] Không tải được model calibration: {e}")
+        except Exception:
+            print(
+                "[Bước 5] Cảnh báo: không đọc được model calibration "
+                f"(file hỏng?), dùng model XGBoost thô thay thế."
+            )
     model = xgb.XGBClassifier()
     model.load_model(str(RISK_MODEL_PATH))
     print(f"[Bước 5] Đã tải mô hình XGBoost thô: {RISK_MODEL_PATH}")
@@ -217,6 +230,8 @@ def compute_metrics(
     detection_intervals: list[float],
     blocked_frames: int,
     released_frames: int,
+    protected_gt_boxes: int,
+    total_protect_gt_boxes: int,
     psnr_sum: float,
     psnr_count: int,
     ssim_sum: float,
@@ -268,6 +283,8 @@ def compute_metrics(
     output_gate_release_rate = released_frames / max(1, total_frames)
     detection_calls_per_100_frames = 100.0 * detection_calls / max(1, total_frames)
     avg_detection_interval = float(np.mean(detection_intervals)) if detection_intervals else 0.0
+    # Tỷ lệ GT box người được protect box phủ với IoU >= 0.5.
+    protect_box_coverage = protected_gt_boxes / max(1, total_protect_gt_boxes)
 
     fps_wall = len(latency_samples) / max(1e-9, sum(latency_samples)) if latency_samples else 0.0
     latency_arr = np.array(latency_samples) if latency_samples else np.array([0.0])
@@ -307,6 +324,9 @@ def compute_metrics(
         "avg_ssim": avg_ssim,
         "output_gate_block_rate": output_gate_block_rate,
         "output_gate_release_rate": output_gate_release_rate,
+        "protect_box_coverage_iou50": protect_box_coverage,
+        "protected_gt_boxes": protected_gt_boxes,
+        "total_protect_gt_boxes": total_protect_gt_boxes,
         "detection_calls_per_100_frames": detection_calls_per_100_frames,
         "average_detection_interval_frames": avg_detection_interval,
         "fps_wall": fps_wall,
@@ -504,6 +524,8 @@ def run_sequence(
     blocked = 0
     released = 0
     unsafe = 0
+    protected_gt_boxes = 0
+    total_protect_gt_boxes = 0
 
     psnr_sum = 0.0
     psnr_count = 0
@@ -700,15 +722,20 @@ def run_sequence(
             released += 1
             out_frame = blur_boxes(frame, protect_boxes_frame)
             gts = gt.get(frame_number, [])
+            frame_unsafe = False
             for gb in gts:
+                total_protect_gt_boxes += 1
                 protected_any = False
                 for pb in protect_boxes_frame:
                     if iou(gb, pb) >= 0.5:
                         protected_any = True
                         break
-                if not protected_any:
-                    unsafe += 1
-                    break
+                if protected_any:
+                    protected_gt_boxes += 1
+                else:
+                    frame_unsafe = True
+            if frame_unsafe:
+                unsafe += 1
 
         if writer is not None:
             writer.write(out_frame)
@@ -746,6 +773,8 @@ def run_sequence(
         "blocked": blocked,
         "released": released,
         "unsafe": unsafe,
+        "protected_gt_boxes": protected_gt_boxes,
+        "total_protect_gt_boxes": total_protect_gt_boxes,
         "psnr_sum": psnr_sum,
         "psnr_count": psnr_count,
         "ssim_sum": ssim_sum,
@@ -804,6 +833,8 @@ def main() -> None:
     total_blocked = 0
     total_released = 0
     total_unsafe = 0
+    total_protected_gt_boxes = 0
+    total_protect_gt_boxes = 0
     total_psnr_sum = 0.0
     total_psnr_count = 0
     total_ssim_sum = 0.0
@@ -818,12 +849,16 @@ def main() -> None:
         if not images:
             continue
 
-        first_frame = cv2.imread(str(images[0]))
-        if first_frame is None:
-            continue
-        h, w = first_frame.shape[:2]
-        if writer is None:
+        if WRITE_VIDEO and writer is None:
+            first_frame = cv2.imread(str(images[0]))
+            if first_frame is None:
+                continue
+            h, w = first_frame.shape[:2]
             writer = cv2.VideoWriter(str(OUT_VIDEO), fourcc, 30.0, (w, h))
+            if not writer.isOpened():
+                print("[Bước 5] Cảnh báo: không mở được VideoWriter, tắt ghi video.")
+                writer.release()
+                writer = None
 
         result = run_sequence(seq, model, risk_model, tau, coordinator_rules, writer, MAX_FRAMES_PER_SEQ)
 
@@ -840,6 +875,8 @@ def main() -> None:
         total_blocked += result["blocked"]
         total_released += result["released"]
         total_unsafe += result["unsafe"]
+        total_protected_gt_boxes += result["protected_gt_boxes"]
+        total_protect_gt_boxes += result["total_protect_gt_boxes"]
         total_psnr_sum += result["psnr_sum"]
         total_psnr_count += result["psnr_count"]
         total_ssim_sum += result["ssim_sum"]
@@ -852,6 +889,7 @@ def main() -> None:
         all_gt, all_pred, all_frames,
         all_latency, total_detection_calls,
         all_intervals, total_blocked, total_released,
+        total_protected_gt_boxes, total_protect_gt_boxes,
         total_psnr_sum, total_psnr_count,
         total_ssim_sum, total_ssim_count,
         all_risk_y_true, all_risk_y_prob,
@@ -872,12 +910,16 @@ def main() -> None:
     with OUT_GATE_LOG.open("w", encoding="utf-8") as f:
         json.dump(gate_log, f, indent=2, ensure_ascii=False)
 
-    print(f"[Bước 5] Đã lưu video đã che: {OUT_VIDEO}")
     print(f"[Bước 5] Đã lưu gate log: {OUT_GATE_LOG}")
+    if WRITE_VIDEO and writer is not None:
+        print(f"[Bước 5] Đã lưu video đã che: {OUT_VIDEO}")
+    else:
+        print("[Bước 5] Bỏ qua ghi video (WRITE_VIDEO=False), vẫn tính metric trên frame đã che.")
     print(f"[Bước 5] Đã lưu chỉ số đánh giá: {OUT_METRICS}")
     print(f"[Bước 5] Detection precision: {metrics['detection_precision']:.4f}")
     print(f"[Bước 5] Detection recall: {metrics['detection_recall']:.4f}")
     print(f"[Bước 5] Detection F1: {metrics['detection_f1']:.4f}")
+    print(f"[Bước 5] Protect-box coverage @ IoU 0.5: {metrics['protect_box_coverage_iou50']:.4f}")
     print(f"[Bước 5] Avg PSNR (dB): {metrics['avg_psnr_db']:.2f}")
     print(f"[Bước 5] Avg SSIM: {metrics['avg_ssim']:.4f}")
     print(f"[Bước 5] Output gate block rate: {metrics['output_gate_block_rate']:.4f}")
