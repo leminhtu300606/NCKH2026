@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+
+# Model weights (large binary)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.joblib
+
+# Dataset & extracted archives (large)
+VisDrone2019-VID-test-dev/
+visdrone-train/
+visdrone_val/
+data/
+zip_extract/
+*.zip
+
+# Generated outputs & results
+outputs/
+results/
+*.mp4
+*.csv
+*.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

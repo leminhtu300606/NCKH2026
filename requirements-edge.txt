@@ -1,0 +1,9 @@
+numpy
+pandas
+opencv-python
+scipy
+xgboost
+psutil
+ultralytics
+pycocotools
+trackeval
