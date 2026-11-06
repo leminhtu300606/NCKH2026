@@ -27,6 +27,7 @@ from typing import Any
 import cv2
 import numpy as np
 import pandas as pd
+import torch
 import xgboost as xgb
 from ultralytics import YOLO
 from ultralytics.trackers.byte_tracker import BYTETracker
@@ -58,7 +59,7 @@ FEATURES = [
     "n_det_expected_ratio",
 ]
 
-IMG_SIZE = 1024
+IMG_SIZE = 640
 CONF_THRES = 0.15
 IOU_THRES = 0.5
 MAX_FRAMES_PER_SEQ = 200
@@ -73,6 +74,9 @@ NEIGHBOR_RADIUS_FRAC = 0.05
 NEIGHBOR_K = 5
 CROP_RESIZE = 224
 SSIM_INTERVAL = 5
+
+DEVICE = "0" if torch.cuda.is_available() else "cpu"
+print(f"[Bước 5] Sử dụng thiết bị: {DEVICE} (CUDA: {torch.cuda.is_available()})")
 
 
 def load_tau() -> float:
@@ -555,7 +559,7 @@ def run_sequence(
         detection_intervals.append(float(det_interval))
 
         if should_detect:
-            results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+            results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=DEVICE, verbose=False)
             detection_calls += 1
             last_detect_frame = frame_idx
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -760,6 +764,7 @@ def main() -> None:
         raise FileNotFoundError(f"Không tìm thấy mô hình XGBoost: {RISK_MODEL_PATH}")
 
     model = YOLO(str(WEIGHTS_PATH))
+    model.to(DEVICE)
     risk_model = load_risk_model()
     tau = load_tau()
 

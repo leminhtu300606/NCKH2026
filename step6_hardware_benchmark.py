@@ -19,6 +19,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import psutil
+import torch
 import xgboost as xgb
 from ultralytics import YOLO
 
@@ -32,6 +33,9 @@ IOU_THRES = 0.5
 WARMUP = 10
 MEASURE = 100
 
+DEVICE = "0" if torch.cuda.is_available() else "cpu"
+print(f"[Bước 6] Sử dụng thiết bị: {DEVICE} (CUDA: {torch.cuda.is_available()})")
+
 
 def main() -> None:
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +46,7 @@ def main() -> None:
         raise FileNotFoundError(f"Không tìm thấy {RISK_MODEL_PATH}")
 
     model = YOLO(str(WEIGHTS_PATH))
+    model.to(DEVICE)
     risk_model = xgb.XGBClassifier()
     risk_model.load_model(str(RISK_MODEL_PATH))
 
@@ -59,7 +64,7 @@ def main() -> None:
 
     # Warm-up
     for _ in range(WARMUP):
-        _ = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+        _ = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=DEVICE, verbose=False)
         X = np.zeros((1, len(FEATURES)))
         _ = risk_model.predict_proba(X)
 
@@ -67,7 +72,7 @@ def main() -> None:
     det_latencies: list[float] = []
     for _ in range(MEASURE):
         t0 = time.perf_counter()
-        _ = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+        _ = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=DEVICE, verbose=False)
         det_latencies.append((time.perf_counter() - t0) * 1000.0)
 
     # Đo latency XGBoost
@@ -82,7 +87,7 @@ def main() -> None:
     e2e_latencies: list[float] = []
     for _ in range(MEASURE):
         t0 = time.perf_counter()
-        _ = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, verbose=False)
+        _ = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=DEVICE, verbose=False)
         X = np.zeros((1, len(FEATURES)))
         _ = risk_model.predict_proba(X)
         cv2.GaussianBlur(frame, (51, 51), 0)
