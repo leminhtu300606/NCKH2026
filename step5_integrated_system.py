@@ -436,29 +436,6 @@ def mota_motp(
     }
 
 
-def compute_lpips(img1: np.ndarray, img2: np.ndarray) -> float | None:
-    """Tính LPIPS giữa hai ảnh (yêu cầu torchvision). Trả về None nếu không có."""
-    try:
-        import torch
-        import torchvision
-        from torchvision.models import LPIPS  # type: ignore
-    except Exception:
-        return None
-    try:
-        # Chuẩn hóa về [-1, 1], resize về 224x224
-        t1 = torch.from_numpy(img1).float().permute(2, 0, 1).unsqueeze(0) / 255.0 * 2.0 - 1.0
-        t2 = torch.from_numpy(img2).float().permute(2, 0, 1).unsqueeze(0) / 255.0 * 2.0 - 1.0
-        t1 = torch.nn.functional.interpolate(t1, size=(224, 224), mode="bilinear", align_corners=False)
-        t2 = torch.nn.functional.interpolate(t2, size=(224, 224), mode="bilinear", align_corners=False)
-        model = LPIPS(net="alex", verbose=False)
-        model.eval()
-        with torch.no_grad():
-            val = model(t1, t2)
-        return float(val.item())
-    except Exception:
-        return None
-
-
 def compute_metrics(
     gt_all: dict[str, dict[int, list[list[float]]]],
     pred_all: dict[str, dict[int, list[list[float]]]],
@@ -476,10 +453,6 @@ def compute_metrics(
     psnr_count: int,
     ssim_sum: float,
     ssim_count: int,
-    lpips_sum: float,
-    lpips_count: int,
-    risk_y_true: list[int] | None = None,
-    risk_y_prob: list[float] | None = None,
 ) -> dict[str, Any]:
     def box_metrics(
         predictions: dict[str, dict[int, list[list[float]] | list[tuple[list[float], float]]]],
@@ -534,7 +507,6 @@ def compute_metrics(
 
     avg_psnr = psnr_sum / max(1, psnr_count) if psnr_count > 0 else 0.0
     avg_ssim = ssim_sum / max(1, ssim_count) if ssim_count > 0 else 0.0
-    avg_lpips = lpips_sum / max(1, lpips_count) if lpips_count > 0 else None
 
     # AP@0.5 và AP@0.5:0.95 (COCO/VOC style) cho detector
     detection_aps = average_precision(
@@ -573,33 +545,6 @@ def compute_metrics(
     )
     latency_arr = np.array(latency_samples) if latency_samples else np.array([0.0])
 
-    risk_auc = None
-    risk_pr_auc = None
-    risk_accuracy = None
-    risk_precision = None
-    risk_recall = None
-    risk_f1 = None
-    risk_brier = None
-    risk_ece = None
-
-    if risk_y_true is not None and risk_y_prob is not None and len(risk_y_true) > 0:
-        y = np.array(risk_y_true, dtype=int)
-        p = np.array(risk_y_prob, dtype=float)
-        if len(np.unique(y)) > 1:
-            from sklearn.metrics import (roc_auc_score, average_precision_score,
-                                         accuracy_score, precision_score,
-                                         recall_score, f1_score,
-                                         brier_score_loss)
-            risk_auc = float(roc_auc_score(y, p))
-            risk_pr_auc = float(average_precision_score(y, p))
-            y_hat = (p >= 0.5).astype(int)
-            risk_accuracy = float(accuracy_score(y, y_hat))
-            risk_precision = float(precision_score(y, y_hat, zero_division=0))
-            risk_recall = float(recall_score(y, y_hat, zero_division=0))
-            risk_f1 = float(f1_score(y, y_hat, zero_division=0))
-            risk_brier = float(brier_score_loss(y, p))
-            risk_ece = expected_calibration_error(y, p)
-
     metrics = {
         "detection_precision": detection_precision,
         "detection_recall": detection_recall,
@@ -609,7 +554,6 @@ def compute_metrics(
         "tracking_f1": tracking_f1,
         "avg_psnr_db": avg_psnr,
         "avg_ssim": avg_ssim,
-        "avg_lpips": avg_lpips if avg_lpips is not None else 0.0,
         "detection_ap50": ap50,
         "detection_ap50_95": ap50_95,
         "tracking_mota": tracking_mot["mota"],
@@ -634,15 +578,6 @@ def compute_metrics(
         "total_gt_boxes_all": total_gt_all,
         "total_pred_boxes": total_pred,
         "total_tracking_pred_boxes": total_tracking_pred,
-        "risk_auc": risk_auc,
-        "risk_pr_auc": risk_pr_auc,
-        "risk_accuracy": risk_accuracy,
-        "risk_precision": risk_precision,
-        "risk_recall": risk_recall,
-        "risk_f1": risk_f1,
-        "risk_brier": risk_brier,
-        "risk_ece": risk_ece,
-        "risk_eval_available": int(risk_auc is not None),
     }
     return metrics
 
@@ -859,8 +794,6 @@ def run_sequence(
     psnr_count = 0
     ssim_sum = 0.0
     ssim_count = 0
-    lpips_sum = 0.0
-    lpips_count = 0
 
     frame_idx = 0
     last_detect_frame = -10000
@@ -1109,15 +1042,6 @@ def run_sequence(
             except Exception:
                 pass
 
-        if frame_idx % SSIM_INTERVAL == 0:
-            try:
-                lpips_val = compute_lpips(frame, out_frame)
-                if lpips_val is not None:
-                    lpips_sum += lpips_val
-                    lpips_count += 1
-            except Exception:
-                pass
-
         latency_ms = (time.perf_counter() - wall_start) * 1000.0
         latency_samples.append(latency_ms)
         frame_idx += 1
@@ -1142,8 +1066,6 @@ def run_sequence(
         "psnr_count": psnr_count,
         "ssim_sum": ssim_sum,
         "ssim_count": ssim_count,
-        "lpips_sum": lpips_sum,
-        "lpips_count": lpips_count,
     }
 
 
@@ -1199,8 +1121,6 @@ def main() -> None:
     all_risks: dict[str, list[float]] = {}
     all_latency: list[float] = []
     all_intervals: list[float] = []
-    all_risk_y_true: list[int] = []
-    all_risk_y_prob: list[float] = []
     total_detection_calls = 0
     total_blocked = 0
     total_released = 0
@@ -1212,8 +1132,6 @@ def main() -> None:
     total_psnr_count = 0
     total_ssim_sum = 0.0
     total_ssim_count = 0
-    total_lpips_sum = 0.0
-    total_lpips_count = 0
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = None
@@ -1248,8 +1166,6 @@ def main() -> None:
         all_risks[seq] = result["risks"]
         all_latency.extend(result["latency_samples"])
         all_intervals.extend(result["detection_intervals"])
-        all_risk_y_true.extend(result["risk_y_true"])
-        all_risk_y_prob.extend(result["risk_y_prob"])
         total_detection_calls += result["detection_calls"]
         total_blocked += result["blocked"]
         total_released += result["released"]
@@ -1261,8 +1177,6 @@ def main() -> None:
         total_psnr_count += result["psnr_count"]
         total_ssim_sum += result["ssim_sum"]
         total_ssim_count += result["ssim_count"]
-        total_lpips_sum += result["lpips_sum"]
-        total_lpips_count += result["lpips_count"]
 
     if writer is not None:
         writer.release()
@@ -1274,8 +1188,6 @@ def main() -> None:
         total_protected_gt_boxes, total_contained_gt_boxes, total_protect_gt_boxes,
         total_psnr_sum, total_psnr_count,
         total_ssim_sum, total_ssim_count,
-        total_lpips_sum, total_lpips_count,
-        all_risk_y_true, all_risk_y_prob,
     )
 
     rows = []

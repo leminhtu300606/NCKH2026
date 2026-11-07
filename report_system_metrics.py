@@ -24,7 +24,6 @@ import pandas as pd
 METRICS_CSV = Path("results/system_metrics_unified.csv")
 HARDWARE_CSV = Path("results/hardware_benchmark.csv")
 GATE_JSON = Path("results/output_gate_log.json")
-RISK_TRAIN_JSON = Path("results/risk_model_training_summary.json")
 OUT_MD = Path("results/system_report.md")
 
 # metric_name -> (nhãn hiển thị, số chữ số thập phân)
@@ -44,7 +43,6 @@ SYSTEM_METRICS = [
     ("effective_privacy_coverage", "Effective privacy coverage (blocked frames blacked out)", 4),
     ("avg_psnr_db", "PSNR (dB)", 2),
     ("avg_ssim", "SSIM", 4),
-    ("avg_lpips", "LPIPS", 4),
     ("output_gate_block_rate", "Output gate block rate", 4),
     ("output_gate_release_rate", "Output gate release rate", 4),
     ("detection_calls_per_100_frames", "Detection calls / 100 frames", 2),
@@ -61,11 +59,6 @@ SYSTEM_METRICS = [
     ("protected_gt_boxes", "Protected GT boxes", 0),
     ("blocked_gt_boxes", "GT boxes on fully blocked frames", 0),
     ("total_protect_gt_boxes", "Evaluated GT boxes (released frames)", 0),
-    ("risk_eval_available", "Risk eval available (0/1)", 0),
-    ("risk_auc", "Risk AUC", 4),
-    ("risk_pr_auc", "Risk PR-AUC", 4),
-    ("risk_brier", "Risk Brier", 4),
-    ("risk_ece", "Risk ECE", 4),
 ]
 
 HARDWARE_LABELS = {
@@ -128,43 +121,17 @@ def main() -> None:
             cpu = sys_row.iloc[0].get("cpu_percent")
             lines += ["", f"- RAM: {fmt(ram, 1)} MB", f"- CPU: {fmt(cpu, 1)} %"]
 
-    if RISK_TRAIN_JSON.exists():
-        rt = json.loads(RISK_TRAIN_JSON.read_text(encoding="utf-8"))
-        lines += ["", "## 4. Mô hình rủi ro XGBoost (huấn luyện lại, cân bằng nhãn)", "",
-                  "| Metric | Value |", "|---|---|"]
-        rows = [
-            ("Samples gốc có nhãn", rt.get("n_labeled_original"), 0),
-            ("Positive rate gốc", rt.get("positive_rate_original"), 4),
-            ("Negative:Positive sau cân bằng", rt.get("neg_pos_ratio"), 1),
-            ("Samples sau cân bằng", rt.get("n_balanced"), 0),
-            ("Positive rate sau cân bằng", rt.get("positive_rate_balanced"), 4),
-            ("OOF AUC (GroupKFold)", rt.get("oof_auc"), 4),
-            ("OOF PR-AUC (GroupKFold)", rt.get("oof_pr_auc"), 4),
-            ("AUC khi fit lại toàn bộ", rt.get("full_fit_auc"), 4),
-            ("Overfit gap (full - OOF)", rt.get("overfit_gap"), 4),
-            ("Temporal hold-out AUC", rt.get("holdout_auc"), 4),
-            ("Temporal hold-out PR-AUC", rt.get("holdout_pr_auc"), 4),
-            ("Tau OOF (target FPR)", rt.get("tau"), 4),
-            ("Tau target FPR", rt.get("tau_target_fpr"), 2),
-            ("Tau TPR đạt được", rt.get("tau_tpr"), 4),
-            ("Tau FPR đạt được", rt.get("tau_fpr_achieved"), 4),
-            ("Tau Youden", rt.get("tau_youden"), 4),
-            ("Chuẩn hóa", rt.get("normalization"), 0),
-        ]
-        for label, value, digits in rows:
-            lines.append(f"| {label} | {fmt(value, digits)} |")
-
     lines += [
         "",
         "## Protocol",
         "",
         "- Person metric: VisDrone category 1, occlusion level 2 excluded, one-to-one matching per frame at IoU >= 0.5.",
         "- YOLO detection metrics use raw detector boxes; ByteTrack metrics use tracker output boxes.",
-        "- Detection AP@0.5 and AP@0.5:0.95 computed in VOC/COCO style with 11-point interpolation over detections pooled across all frames.",
+        "- Detection AP@0.5 and AP@0.5:0.95 computed in COCO style with 101-point interpolation over detections pooled across all frames.",
         "- MOTA/MOTP computed with per-frame one-to-one matching at IoU >= 0.5; IDSW is 0 because VisDrone VID test-dev does not provide ground-truth track IDs.",
+        "- Risk model evaluation is available only for sequences that overlap between risk_dataset.csv and VisDrone test-dev (11 of 17 sequences); risk metrics are not reported end-to-end.",
         "- Protection IoU coverage is conditional on released frames only; blocked frames are blacked out and are reported separately, not counted as IoU-covered boxes.",
         "- Low detector confidence is used to prioritize coverage; false positives can cause substantial extra blur and lower precision.",
-        "- LPIPS is computed with torchvision AlexNet when available; otherwise omitted.",
         "- Thresholds were selected after a sweep on 715 labeled frames from these same 17 sequences; aggregate metrics are exploratory, not an independent holdout result.",
     ]
 
