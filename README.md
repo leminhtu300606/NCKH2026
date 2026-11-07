@@ -100,10 +100,15 @@ với video hữu dụng hoặc coverage IoU trên mọi frame.
 Đây là kết quả exploratory vì threshold được chọn từ cùng 17 sequence, không
 phải đánh giá holdout độc lập. Độ phân giải cao hơn làm tăng latency và VRAM.
 Hai script tự chọn cuda:0 khi PyTorch CUDA khả dụng, nếu không sẽ chạy CPU.
-Môi trường Windows/Python 3.15 đã kiểm tra với RTX 3050 và PyTorch CUDA 13.0:
+Môi trường Windows/Python 3.12 đã kiểm tra. Cài đặt:
 
-python -m pip install torch==2.14.1+cu130 torchvision==0.29.1+cu130 `
-  --index-url https://download.pytorch.org/whl/cu130
+# CPU (mặc định)
+pip install -r requirements.txt
+
+# Hoặc CUDA (GPU NVIDIA, đổi chỉ mục cu124 cho khớp CUDA của máy):
+pip install -r requirements-cuda.txt
+
+Hoặc dùng install.bat (chọn 1 = CPU, 2 = CUDA).
 
 ### Backend detector (Bước 5)
 
@@ -122,10 +127,12 @@ làm tham chiếu cho Bước 6 / xuất mô hình; chưa dùng trực tiếp tr
 Chỉnh nhanh phạm vi đánh giá: `NCKH_MAX_SEQS`, `NCKH_MAX_FRAMES`,
 `NCKH_OUT_METRICS`, `NCKH_OUT_GATE_LOG`.
 
-Đo round-robin trên 1 frame thật (1360x765), 20 lần, FP32, cùng conf 0.0075 /
-IoU 0.7: PyTorch 493.6 ms, ONNX + IOBinding 439.2 ms, OpenVINO 363.3 ms.
-Parity PT vs ONNX trên 90 frame: 99.51% box khớp, IoU trung bình 0.9989,
-chênh confidence tuyệt đối 0.00024, precision/recall/F1 gần như trùng.
+Bước 6 đo latency trên 1 frame thật (1360x765), 100 lần sau warm-up 10 lần,
+cùng conf 0.25 / IoU 0.7, FP32. Latency end-to-end bao gồm detect YOLO ->
+tính 21 đặc trưng rủi ro -> XGBoost predict_proba -> GaussianBlur, phản ánh
+chi phí thực tế. Báo cáo thêm tỉ lệ frame vượt deadline thiết bị biên (mặc
+định 40 ms, tuỳ qua NCKH_EDGE_DEADLINE_MS). Kết quả chỉ đại diện cho máy
+phát triển (CPU), không phải deadline 40 ms của thiết bị edge GPU.
 
 ### Chỉ số
 

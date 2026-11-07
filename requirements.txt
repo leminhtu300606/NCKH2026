@@ -1,10 +1,11 @@
 # =============================================================================
 # Dependencies cho hệ thống bảo vệ riêng tư video UAV (NCKH2026)
 # Người khác pull code về chỉ cần chạy:  pip install -r requirements.txt
+# (phiên bản CPU; nếu có GPU NVIDIA, hãy cài requirements-cuda.txt thay thế)
+# Các phiên bản đã kiểm tra chạy được trên Windows + Python 3.12.
 # =============================================================================
 
-# PyTorch (phiên bản hiện tại là CPU-only trên máy phát triển)
-# Nếu máy đích có GPU NVIDIA, hãy cài torch bản CUDA từ https://pytorch.org
+# PyTorch CPU (máy phát triển). Máy có GPU NVIDIA hãy dùng requirements-cuda.txt
 torch==2.15.0+cpu
 torchvision==0.29.2+cpu
 
@@ -18,7 +19,7 @@ onnxslim==0.1.98
 openvino==2026.4.1          # Tuỳ chọn: chỉ cần nếu dùng backend OpenVINO
 
 # Xử lý ảnh / số liệu
-opencv-python==5.0.0.93
+opencv-python==5.0.0
 numpy==2.5.4
 pandas==3.1.0
 scipy==1.18.1

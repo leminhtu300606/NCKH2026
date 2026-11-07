@@ -1,0 +1,26 @@
+# =============================================================================
+# Dependencies CUDA cho hệ thống bảo vệ riêng tư video UAV (NCKH2026)
+# Thay thế requirements.txt khi máy đích có GPU NVIDIA.
+# Chạy: pip install -r requirements-cuda.txt
+# =============================================================================
+
+# PyTorch CUDA (tùy theo CUDA đã cài trên máy, ví dụ cu121/cu124):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Ở đây pin bản cu124 làm ví dụ; hãy đổi cho khớp CUDA của máy.
+torch==2.15.0+cu124
+torchvision==0.29.2+cu124
+
+ultralytics==8.4.197
+onnxruntime-gpu==1.31.1
+onnx==1.23.2
+onnxslim==0.1.98
+openvino==2026.4.1
+
+opencv-python==5.0.0
+numpy==2.5.4
+pandas==3.1.0
+scipy==1.18.1
+
+xgboost==3.4.1
+scikit-learn==1.9.1
+psutil==7.2.2
