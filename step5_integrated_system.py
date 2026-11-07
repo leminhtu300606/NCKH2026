@@ -141,11 +141,14 @@ def predict_risk(risk_model: Any, X: np.ndarray) -> float:
 def load_risk_labels_lookup() -> dict:
     """Tải nhãn rủi ro ground truth từ risk_dataset.csv để đánh giá model tại runtime.
 
-    Lookup key: (sequence, track_id) -> list of (window_start, window_end, label).
-    Chỉ dùng nhãn khi track_id và frame khớp với cửa sổ trong artifact; nếu không
-    khớp, bỏ qua track đó (không ép nhãn giả tạo).
+    Lookup key: (sequence, frame_idx) -> list of label (0/1).
+    Vì track_id runtime (ByteTrack gán mới) khác track_id trong artifact
+    (rủi ro artifact được sinh từ một lần tracking cũ) và risk_dataset.csv
+    không lưu box coordinates, chúng ta match theo (sequence, frame):
+    nếu có bất kỳ artifact track nào trong cùng frame có label=1, frame
+    đó được coi là rủi ro (conservative).
     """
-    lookup: dict[tuple[str, int], list[tuple[int, int, int]]] = {}
+    lookup: dict[tuple[str, int], list[int]] = {}
     if not RISK_DATASET_PATH.exists():
         print(
             f"[Bước 5] Cảnh báo: không tìm thấy {RISK_DATASET_PATH}, "
@@ -154,11 +157,13 @@ def load_risk_labels_lookup() -> dict:
         return lookup
     df = pd.read_csv(RISK_DATASET_PATH)
     for _, row in df.iterrows():
-        key = (str(row["sequence"]), int(row["track_id"]))
-        lookup.setdefault(key, []).append(
-            (int(row["window_start"]), int(row["window_end"]), int(row["label"]))
-        )
-    print(f"[Bước 5] Đã tải {len(lookup)} khóa nhãn rủi ro từ {RISK_DATASET_PATH}")
+        seq = str(row["sequence"])
+        ws = int(row["window_start"])
+        we = int(row["window_end"])
+        lbl = int(row["label"])
+        for f in range(ws, we + 1):
+            lookup.setdefault((seq, f), []).append(lbl)
+    print(f"[Bước 5] Đã tải nhãn rủi ro cho {len(lookup)} (sequence, frame) từ {RISK_DATASET_PATH}")
     return lookup
 
 
@@ -323,11 +328,14 @@ def average_precision(
     gts_by_frame: dict[str, dict[int, list[list[float]]]],
     iou_thresholds: list[float],
 ) -> dict[float, float]:
-    """Tính Average Precision (VOC/COCO style) tại các ngưỡng IoU.
+    """Tính Average Precision (COCO style) tại các ngưỡng IoU.
 
     preds_by_frame: seq -> frame -> list of (box, conf)
     gts_by_frame: seq -> frame -> list of box
     Trả về dict {iou_threshold: AP}.
+
+    AP được tính bằng cách integral của precision-recall envelope
+    tại 101 ngưỡng recall (0.00, 0.01, ..., 1.00), chuẩn COCO.
     """
     # Gom tất cả detection thành danh sách (seq, frame, box, conf)
     all_dets: list[tuple[str, int, list[float], float]] = []
@@ -370,12 +378,12 @@ def average_precision(
         cum_fp = np.cumsum(fp)
         recalls = cum_tp / max(1, total_gt)
         precisions = cum_tp / np.maximum(cum_tp + cum_fp, 1e-9)
-        # VOC AP: integral of precision-recall envelope (11-point interpolation)
+        # COCO AP: integral of precision-recall envelope at 101 recall points
         ap = 0.0
-        for t in np.arange(0.0, 1.1, 0.1):
+        for t in np.linspace(0.0, 1.0, 101):
             p_at_recall = precisions[recalls >= t].max() if np.any(recalls >= t) else 0.0
             ap += p_at_recall
-        aps[iou_thr] = float(ap / 11.0)
+        aps[iou_thr] = float(ap / 101.0)
     return aps
 
 
@@ -468,8 +476,8 @@ def compute_metrics(
     psnr_count: int,
     ssim_sum: float,
     ssim_count: int,
-    lpisms_sum: float,
-    lpisms_count: int,
+    lpips_sum: float,
+    lpips_count: int,
     risk_y_true: list[int] | None = None,
     risk_y_prob: list[float] | None = None,
 ) -> dict[str, Any]:
@@ -526,7 +534,7 @@ def compute_metrics(
 
     avg_psnr = psnr_sum / max(1, psnr_count) if psnr_count > 0 else 0.0
     avg_ssim = ssim_sum / max(1, ssim_count) if ssim_count > 0 else 0.0
-    avg_lpips = lpisms_sum / max(1, lpisms_count) if lpisms_count > 0 else None
+    avg_lpips = lpips_sum / max(1, lpips_count) if lpips_count > 0 else None
 
     # AP@0.5 và AP@0.5:0.95 (COCO/VOC style) cho detector
     detection_aps = average_precision(
@@ -851,8 +859,8 @@ def run_sequence(
     psnr_count = 0
     ssim_sum = 0.0
     ssim_count = 0
-    lpisms_sum = 0.0
-    lpisms_count = 0
+    lpips_sum = 0.0
+    lpips_count = 0
 
     frame_idx = 0
     last_detect_frame = -10000
@@ -1018,15 +1026,14 @@ def run_sequence(
             X_norm = risk_standardizer.transform(X).reshape(1, -1)
             risk_prob = predict_risk(risk_model, X_norm)
             # Chỉ ghi nhận cặp (y_true, y_prob) khi có ground truth label khớp
-            # theo (sequence, track_id, cửa sổ frame) từ risk_dataset.csv.
+            # theo (sequence, frame) từ risk_dataset.csv.
             matched_label: int | None = None
             if risk_labels_lookup:
-                track_key = (seq_name, tid)
-                if track_key in risk_labels_lookup:
-                    for ws, we, lbl in risk_labels_lookup[track_key]:
-                        if ws <= frame_idx <= we:
-                            matched_label = lbl
-                            break
+                frame_key = (seq_name, frame_idx)
+                if frame_key in risk_labels_lookup:
+                    # Nếu có bất kỳ artifact track nào trong frame này có label=1,
+                    # coi frame đó là rủi ro (conservative).
+                    matched_label = int(max(risk_labels_lookup[frame_key]))
             if matched_label is not None:
                 risk_y_true.append(matched_label)
                 risk_y_prob.append(risk_prob)
@@ -1135,8 +1142,8 @@ def run_sequence(
         "psnr_count": psnr_count,
         "ssim_sum": ssim_sum,
         "ssim_count": ssim_count,
-        "lpisms_sum": lpisms_sum,
-        "lpisms_count": lpisms_count,
+        "lpips_sum": lpips_sum,
+        "lpips_count": lpips_count,
     }
 
 
@@ -1205,8 +1212,8 @@ def main() -> None:
     total_psnr_count = 0
     total_ssim_sum = 0.0
     total_ssim_count = 0
-    total_lpisms_sum = 0.0
-    total_lpisms_count = 0
+    total_lpips_sum = 0.0
+    total_lpips_count = 0
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = None
@@ -1254,8 +1261,8 @@ def main() -> None:
         total_psnr_count += result["psnr_count"]
         total_ssim_sum += result["ssim_sum"]
         total_ssim_count += result["ssim_count"]
-        total_lpisms_sum += result["lpisms_sum"]
-        total_lpisms_count += result["lpisms_count"]
+        total_lpips_sum += result["lpips_sum"]
+        total_lpips_count += result["lpips_count"]
 
     if writer is not None:
         writer.release()
@@ -1267,7 +1274,7 @@ def main() -> None:
         total_protected_gt_boxes, total_contained_gt_boxes, total_protect_gt_boxes,
         total_psnr_sum, total_psnr_count,
         total_ssim_sum, total_ssim_count,
-        total_lpisms_sum, total_lpisms_count,
+        total_lpips_sum, total_lpips_count,
         all_risk_y_true, all_risk_y_prob,
     )
 
