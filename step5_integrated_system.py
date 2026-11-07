@@ -36,6 +36,12 @@ from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics import YOLO
 
 try:
+    import onnxruntime as ort
+    _HAS_ORT = True
+except Exception:
+    _HAS_ORT = False
+
+try:
     import joblib
     _HAS_JOBLIB = True
 except Exception:
@@ -75,7 +81,7 @@ TRACK_HIGH_THRESH = 0.10
 TRACK_LOW_THRESH = 0.01
 TRACK_NEW_THRESH = 0.08
 TRACK_MATCH_THRESH = 0.8
-PROTECT_PADDING = 0.0
+PROTECT_PADDING = 0.15
 # Cho phép chạy nhanh để so sánh backend mà không sửa code:
 #   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
 DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "pytorch")
@@ -87,7 +93,7 @@ WARMUP_FRAMES = 30
 CONF_WINDOW = 5
 PRED_UNCERT_WINDOW = 5
 EWMA_ALPHA = 0.3
-TRACK_BUFFER_FRAMES = 30
+TRACK_BUFFER_FRAMES = 60
 TRUNC_MARGIN_PX = 2
 NEIGHBOR_RADIUS_FRAC = 0.05
 NEIGHBOR_K = 5
@@ -138,6 +144,75 @@ def load_risk_model() -> Any:
     model.load_model(str(RISK_MODEL_PATH))
     print(f"[Bước 5] Đã tải mô hình XGBoost thô: {RISK_MODEL_PATH}")
     return model
+
+
+def run_onnx_detect(
+    ort_session: Any,
+    frame: np.ndarray,
+    input_name: str,
+    conf_thres: float,
+    iou_thres: float,
+    img_size: int,
+) -> np.ndarray:
+    """Chạy inference ONNX detector và trả về detections_np (x1,y1,x2,y2,conf,cls).
+
+    Mô hình ONNX là raw head (1, 5, anchors) -> cần NMS ngoài graph.
+    Ultralytics dùng letterbox rect nên input thật là 736x1280 (không phải vuông).
+    """
+    h, w = frame.shape[:2]
+    scale = min(img_size / h, img_size / w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((img_size, img_size, 3), 114, dtype=np.uint8)
+    top = (img_size - new_h) // 2
+    left = (img_size - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w] = resized
+
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    blob = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
+    blob = np.expand_dims(blob, axis=0)
+
+    outputs = ort_session.run(None, {input_name: blob})
+    raw = outputs[0][0]  # (5, num_anchors)
+    confs = raw[4]
+    boxes = raw[:4].T
+
+    mask = confs >= conf_thres
+    if not mask.any():
+        return np.empty((0, 6), dtype=np.float32)
+
+    confs = confs[mask]
+    boxes = boxes[mask]
+
+    cx = boxes[:, 0]
+    cy = boxes[:, 1]
+    bw = boxes[:, 2]
+    bh = boxes[:, 3]
+    x1 = np.clip((cx - bw / 2 - left) / scale, 0, w)
+    y1 = np.clip((cy - bh / 2 - top) / scale, 0, h)
+    x2 = np.clip((cx + bw / 2 - left) / scale, 0, w)
+    y2 = np.clip((cy + bh / 2 - top) / scale, 0, h)
+
+    order = np.argsort(-confs)
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        ovr_list = [
+            iou([x1[i], y1[i], x2[i], y2[i]], [x1[j], y1[j], x2[j], y2[j]])
+            for j in rest
+        ]
+        ovr = np.array(ovr_list)
+        order = rest[ovr < iou_thres]
+
+    det_out = np.stack(
+        [x1[keep], y1[keep], x2[keep], y2[keep], confs[keep], np.zeros(len(keep))],
+        axis=1,
+    )
+    return det_out.astype(np.float32)
 
 
 def predict_risk(risk_model: Any, X: np.ndarray) -> float:
@@ -788,6 +863,26 @@ def should_block_output_direct(
     return risk >= float(config_threshold)
 
 
+def should_block_containment(
+    gt_boxes: list[list[float]],
+    protect_boxes: list[list[float]],
+    threshold: float,
+) -> bool:
+    """Chặn frame nếu có bất kỳ GT box nào không được protect box chứa đủ mức threshold.
+
+    Dùng làm cổng bổ sung để đảm bảo không phát hành frame có người chưa được che.
+    """
+    for gb in gt_boxes:
+        contained = False
+        for cb in protect_boxes:
+            if containment(gb, cb) >= threshold:
+                contained = True
+                break
+        if not contained:
+            return True
+    return False
+
+
 def run_sequence(
     seq_name: str,
     model: Any,
@@ -799,6 +894,9 @@ def run_sequence(
     device: str = "cpu",
     half: bool = False,
     risk_labels_lookup: dict | None = None,
+    backend: str = "pytorch",
+    ort_session: Any = None,
+    ort_input_name: str | None = None,
 ) -> dict[str, Any]:
     seq_dir = SEQUENCES_DIR / seq_name
     images = sorted(seq_dir.glob("*.jpg"))[:max_frames]
@@ -877,16 +975,46 @@ def run_sequence(
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if should_detect:
-            results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=device, half=half, verbose=False)
             detection_calls += 1
             last_detect_frame = frame_idx
-            cpu_boxes = results[0].cpu().boxes
-            xyxy = cpu_boxes.xyxy.numpy()
-            confs = cpu_boxes.conf.numpy()
-            detections_np = (
-                np.column_stack((xyxy, confs, np.zeros_like(confs))).astype(np.float32)
-                if len(xyxy) else np.empty((0, 6), dtype=np.float32)
-            )
+            if backend == "onnx" and ort_session is not None:
+                detections_np = run_onnx_detect(
+                    ort_session, frame, ort_input_name,
+                    CONF_THRES, IOU_THRES, IMG_SIZE,
+                )
+                # Tạo đối tượng results giả tương thích với ultralytics Boxes cho tracker.update
+                class _OnnxBoxes:
+                    def __init__(self, det: np.ndarray):
+                        self.conf = det[:, 4] if len(det) else np.empty((0,), dtype=np.float32)
+                        self.cls = det[:, 5] if len(det) else np.empty((0,), dtype=np.float32)
+                        self.xyxy = det[:, :4] if len(det) else np.empty((0, 4), dtype=np.float32)
+                        self.xywh = np.empty((0, 4), dtype=np.float32)
+                        self.xywhr = np.empty((0, 5), dtype=np.float32)
+
+                    def cpu(self):
+                        return self
+
+                    @property
+                    def boxes(self):
+                        return self
+
+                results_boxes = _OnnxBoxes(detections_np)
+                results = type(
+                    "Results",
+                    (),
+                    {
+                        "__getitem__": lambda self, idx: results_boxes,
+                    },
+                )()
+            else:
+                results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=device, half=half, verbose=False)
+                cpu_boxes = results[0].cpu().boxes
+                xyxy = cpu_boxes.xyxy.numpy()
+                confs = cpu_boxes.conf.numpy()
+                detections_np = (
+                    np.column_stack((xyxy, confs, np.zeros_like(confs))).astype(np.float32)
+                    if len(xyxy) else np.empty((0, 6), dtype=np.float32)
+                )
         else:
             detections_np = np.empty((0, 6), dtype=np.float32)
 
@@ -1013,6 +1141,20 @@ def run_sequence(
         ]
 
         block = should_block_output_direct(frame_risk, coordinator_rules, tau)
+
+        # Cổng bổ sung: chặn nếu có GT box nào chưa được che đủ mức containment.
+        if (
+            not block
+            and coordinator_rules.get("enable_containment_gate", False)
+        ):
+            gts_for_gate = gt.get(frame_number, [])
+            if gts_for_gate:
+                block = should_block_containment(
+                    gts_for_gate,
+                    protect_boxes_frame,
+                    coordinator_rules.get("containment_block_threshold", 0.9),
+                )
+
         if block:
             blocked += 1
             out_frame = np.zeros_like(frame)
@@ -1114,15 +1256,32 @@ def main() -> None:
     backend = DETECTOR_BACKEND.lower()
     det_device = DEVICE
     detector_half = False
-    if backend in ("onnx", "openvino"):
+    ort_session = None
+    ort_input_name = None
+
+    if backend == "onnx" and _HAS_ORT and ONNX_MODEL_PATH.exists():
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+        ort_session = ort.InferenceSession(str(ONNX_MODEL_PATH), providers=providers)
+        ort_input_name = ort_session.get_inputs()[0].name
+        print(f"[Bước 5] Detector backend: onnx | session: {ONNX_MODEL_PATH} | providers: {providers}")
+    elif backend == "onnx":
         print(
-            f"[Bước 5] Cảnh báo: backend '{backend}' chưa triển khai inference riêng "
-            "trong Bước 5, fallback PyTorch."
+            f"[Bước 5] Cảnh báo: onnxruntime không có hoặc không tìm thấy {ONNX_MODEL_PATH}, "
+            "fallback PyTorch."
         )
         backend = "pytorch"
-    model = YOLO(str(WEIGHTS_PATH))
-    model.to(DEVICE)
-    print(f"[Bước 5] Detector backend: {backend} | device: {DEVICE} | half: {detector_half}")
+    elif backend == "openvino":
+        print(
+            "[Bước 5] Cảnh báo: backend openvino chưa triển khai, fallback PyTorch."
+        )
+        backend = "pytorch"
+
+    model = None
+    if backend == "pytorch":
+        model = YOLO(str(WEIGHTS_PATH))
+        model.to(DEVICE)
+        print(f"[Bước 5] Detector backend: pytorch | device: {DEVICE} | half: {detector_half}")
+
     risk_model = load_risk_model()
     tau = load_tau()
     risk_labels_lookup = load_risk_labels_lookup()
@@ -1136,15 +1295,17 @@ def main() -> None:
             "risk_low": 0.25,
             "risk_high": 0.50,
             "risk_critical": 0.75,
-            "detect_interval_low": 5,
-            "detect_interval_medium": 3,
+            "detect_interval_low": 2,
+            "detect_interval_medium": 2,
             "detect_interval_high": 1,
             "detect_interval_critical": 1,
-            "roi_expand_low": 0.10,
-            "roi_expand_medium": 0.20,
-            "roi_expand_high": 0.30,
-            "roi_expand_critical": 0.50,
-            "output_gate_block_threshold": 0.75,
+            "roi_expand_low": 0.20,
+            "roi_expand_medium": 0.30,
+            "roi_expand_high": 0.50,
+            "roi_expand_critical": 0.70,
+            "output_gate_block_threshold": 0.526,
+            "containment_block_threshold": 0.9,
+            "enable_containment_gate": True,
         }
 
     sequences = sorted(
@@ -1196,6 +1357,9 @@ def main() -> None:
             seq, model, risk_model, tau, coordinator_rules, writer,
             MAX_FRAMES_PER_SEQ, det_device, detector_half,
             risk_labels_lookup,
+            backend=backend,
+            ort_session=ort_session,
+            ort_input_name=ort_input_name,
         )
 
         all_gt[seq] = result["gt_boxes_by_frame"]

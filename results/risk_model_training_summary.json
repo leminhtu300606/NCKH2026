@@ -91,5 +91,11 @@
   ],
   "holdout_n_samples": 2930,
   "holdout_auc": 0.7245684838861444,
-  "holdout_pr_auc": 0.06138573747029592
+  "holdout_pr_auc": 0.06138573747029592,
+  "ece_raw": 0.393533555783669,
+  "ece_calibrated": 0.0,
+  "brier_raw": 0.20882755417126392,
+  "brier_calibrated": 0.05054044584463516,
+  "auc_calibrated_oof": 0.7138717325487047,
+  "calibrated_path": "models\\xgboost_risk_calibrated.joblib"
 }
