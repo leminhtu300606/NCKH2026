@@ -1,0 +1,13 @@
+{
+  "backbone": "osnet_x1_0",
+  "anon_method": "blur",
+  "anon_ksize": 15,
+  "anon_block": 8,
+  "gallery_min_gap": 30,
+  "cross_sequence": true,
+  "window": [
+    60,
+    1
+  ],
+  "features": 21
+}

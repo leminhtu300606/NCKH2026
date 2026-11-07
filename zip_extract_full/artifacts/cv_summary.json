@@ -1,0 +1,53 @@
+{
+  "n_samples": 40589,
+  "n_groups": 35,
+  "n_splits": 5,
+  "degenerate": false,
+  "folds": [
+    {
+      "fold": 0,
+      "n_train": 30137,
+      "n_val": 10452,
+      "auc": 0.6475443456681371,
+      "pr_auc": 0.22158156313070893,
+      "best_iteration": 1
+    },
+    {
+      "fold": 1,
+      "n_train": 33056,
+      "n_val": 7533,
+      "auc": 0.45735477547076464,
+      "pr_auc": 0.04562247128194599,
+      "best_iteration": 9
+    },
+    {
+      "fold": 2,
+      "n_train": 33052,
+      "n_val": 7537,
+      "auc": 0.5757238454912874,
+      "pr_auc": 0.04391561681494539,
+      "best_iteration": 13
+    },
+    {
+      "fold": 3,
+      "n_train": 33054,
+      "n_val": 7535,
+      "auc": 0.5908133020630402,
+      "pr_auc": 0.08060076600527964,
+      "best_iteration": 7
+    },
+    {
+      "fold": 4,
+      "n_train": 33057,
+      "n_val": 7532,
+      "auc": 0.5505553772642989,
+      "pr_auc": 0.12766136536086983,
+      "best_iteration": 11
+    }
+  ],
+  "oof_auc": 0.3832703402101427,
+  "oof_pr_auc": 0.051570727090762734,
+  "brier_raw": 0.05287267085713337,
+  "brier_calibrated": 0.022971286758080495,
+  "calibration_method": "isotonic_prefit_on_oof"
+}

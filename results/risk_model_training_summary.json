@@ -1,0 +1,88 @@
+{
+  "source_csv": "zip_extract_full\\artifacts\\risk_dataset.csv",
+  "balanced_csv": "zip_extract_full\\artifacts\\risk_dataset_balanced.csv",
+  "n_labeled_original": 40589,
+  "positives_original": 2251,
+  "positive_rate_original": 0.05545837542191234,
+  "neg_pos_ratio": 5.0,
+  "normalization": "causal per-sequence z-score (Welford, min_n=50)",
+  "evaluation": "GroupKFold theo sequence tren phan phoi nhan goc; chi can bang tap train trong moi fold",
+  "n_balanced": 13506,
+  "positive_rate_balanced": 0.16666666666666666,
+  "n_groups": 35,
+  "params": {
+    "n_estimators": 300,
+    "max_depth": 2,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_lambda": 5.0,
+    "reg_alpha": 0.5,
+    "objective": "binary:logistic",
+    "eval_metric": "aucpr",
+    "tree_method": "hist",
+    "random_state": 42,
+    "scale_pos_weight": 5.000000000000001
+  },
+  "scale_pos_weight": 5.000000000000001,
+  "folds": [
+    {
+      "fold": 0,
+      "n_train": 5304,
+      "n_val": 10452,
+      "auc": 0.6619122253898098,
+      "pr_auc": 0.21802572773420034,
+      "best_iteration": 10
+    },
+    {
+      "fold": 1,
+      "n_train": 12090,
+      "n_val": 7533,
+      "auc": 0.7472559538050231,
+      "pr_auc": 0.11200209182053682,
+      "best_iteration": 10
+    },
+    {
+      "fold": 2,
+      "n_train": 11886,
+      "n_val": 7537,
+      "auc": 0.637409344117752,
+      "pr_auc": 0.05522668877123898,
+      "best_iteration": 37
+    },
+    {
+      "fold": 3,
+      "n_train": 12150,
+      "n_val": 7535,
+      "auc": 0.7286358677687952,
+      "pr_auc": 0.07285115335217866,
+      "best_iteration": 2
+    },
+    {
+      "fold": 4,
+      "n_train": 12594,
+      "n_val": 7532,
+      "auc": 0.6816801276565397,
+      "pr_auc": 0.059710629973164384,
+      "best_iteration": 29
+    }
+  ],
+  "oof_auc": 0.674676025185878,
+  "oof_pr_auc": 0.10291024360224606,
+  "full_fit_auc": 0.9252295726160299,
+  "overfit_gap": 0.2505535474301519,
+  "holdout_fraction": 0.2,
+  "holdout_sequences": [
+    "uav0000295_02300_v",
+    "uav0000297_02761_v",
+    "uav0000306_00230_v",
+    "uav0000307_00000_v",
+    "uav0000308_00000_v",
+    "uav0000308_01380_v",
+    "uav0000355_00001_v"
+  ],
+  "holdout_n_samples": 2930,
+  "holdout_auc": 0.7189484827099506,
+  "holdout_pr_auc": 0.056838365896980464
+}

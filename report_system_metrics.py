@@ -33,6 +33,7 @@ SYSTEM_METRICS = [
     ("detection_recall", "Detection recall", 4),
     ("detection_f1", "Detection F1", 4),
     ("protect_box_coverage_iou50", "Protect-box coverage @ IoU 0.5", 4),
+    ("protect_box_containment90", "Protect-box containment @ 90%", 4),
     ("avg_psnr_db", "PSNR (dB)", 2),
     ("avg_ssim", "SSIM", 4),
     ("output_gate_block_rate", "Output gate block rate", 4),
@@ -61,6 +62,8 @@ HARDWARE_LABELS = {
 def fmt(value: Any, digits: int) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "-"
+    if isinstance(value, str):
+        return value
     if digits == 0:
         return f"{int(round(float(value))):,}"
     return f"{float(value):.{digits}f}"
@@ -121,6 +124,9 @@ def main() -> None:
             ("OOF PR-AUC (GroupKFold)", rt.get("oof_pr_auc"), 4),
             ("AUC khi fit lại toàn bộ", rt.get("full_fit_auc"), 4),
             ("Overfit gap (full - OOF)", rt.get("overfit_gap"), 4),
+            ("Temporal hold-out AUC", rt.get("holdout_auc"), 4),
+            ("Temporal hold-out PR-AUC", rt.get("holdout_pr_auc"), 4),
+            ("Chuẩn hóa", rt.get("normalization"), 0),
         ]
         for label, value, digits in rows:
             lines.append(f"| {label} | {fmt(value, digits)} |")

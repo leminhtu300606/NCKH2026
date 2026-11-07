@@ -119,6 +119,42 @@ def predict_risk(risk_model: Any, X: np.ndarray) -> float:
     return float(risk_model.predict_proba(X)[0, 1])
 
 
+NORM_MIN_SAMPLES = 50
+
+
+class SequenceStandardizer:
+    """Chuẩn hóa z-score online theo sequence, chỉ dùng dữ liệu quá khứ.
+
+    Khớp với cách huấn luyện trong `step_train_risk_model.py`:
+    - `min_n` vector đầu tiên giữ nguyên giá trị thô;
+    - các vector sau chuẩn hóa bằng mean/std của các vector trước đó (Welford).
+    Nhờ vậy model không bị lệch phân phối giữa các sequence (domain shift).
+    """
+
+    def __init__(self, n_features: int, min_n: int = NORM_MIN_SAMPLES):
+        self.n = 0
+        self.min_n = min_n
+        self.mean = np.zeros(n_features, dtype=np.float64)
+        self.m2 = np.zeros(n_features, dtype=np.float64)
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        if self.n == 0:
+            self.n = 1
+            self.mean = x.copy()
+            return x.astype(np.float32)
+        if self.n < self.min_n:
+            out = x.copy()
+        else:
+            sd = np.sqrt(np.maximum(self.m2 / self.n, 1e-6))
+            out = (x - self.mean) / sd
+        self.n += 1
+        d = x - self.mean
+        self.mean = self.mean + d / self.n
+        self.m2 = self.m2 + d * (x - self.mean)
+        return out.astype(np.float32)
+
+
 def load_annotations(seq_name: str) -> dict[int, list[list[float]]]:
     ann_path = ANNOTATIONS_DIR / f"{seq_name}.txt"
     gt: dict[int, list[list[float]]] = {}
@@ -149,6 +185,21 @@ def iou(box1: list[float], box2: list[float]) -> float:
     area2 = max(0, box2[2] - box2[0]) * max(0, box2[3] - box2[1])
     union = area1 + area2 - inter
     return inter / union if union > 0 else 0.0
+
+
+def containment(gt_box: list[float], cover_box: list[float]) -> float:
+    """Tỷ lệ diện tích GT box nằm trong cover box (0..1).
+
+    Phù hợp để đo mức che phủ vì protect box được mở rộng (ROI padding) nên
+    IoU sẽ bị giảm dù GT vẫn được che hoàn toàn.
+    """
+    x1 = max(gt_box[0], cover_box[0])
+    y1 = max(gt_box[1], cover_box[1])
+    x2 = min(gt_box[2], cover_box[2])
+    y2 = min(gt_box[3], cover_box[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    gt_area = max(0, gt_box[2] - gt_box[0]) * max(0, gt_box[3] - gt_box[1])
+    return inter / gt_area if gt_area > 0 else 0.0
 
 
 def expand_box(box: list[float], padding: float, img_w: int, img_h: int) -> list[float]:
@@ -231,6 +282,7 @@ def compute_metrics(
     blocked_frames: int,
     released_frames: int,
     protected_gt_boxes: int,
+    contained_gt_boxes: int,
     total_protect_gt_boxes: int,
     psnr_sum: float,
     psnr_count: int,
@@ -285,6 +337,8 @@ def compute_metrics(
     avg_detection_interval = float(np.mean(detection_intervals)) if detection_intervals else 0.0
     # Tỷ lệ GT box người được protect box phủ với IoU >= 0.5.
     protect_box_coverage = protected_gt_boxes / max(1, total_protect_gt_boxes)
+    # Tỷ lệ GT box được protect box che >= 90% diện tích (đúng bản chất ROI padding).
+    protect_box_containment = contained_gt_boxes / max(1, total_protect_gt_boxes)
 
     fps_wall = len(latency_samples) / max(1e-9, sum(latency_samples)) if latency_samples else 0.0
     latency_arr = np.array(latency_samples) if latency_samples else np.array([0.0])
@@ -325,7 +379,9 @@ def compute_metrics(
         "output_gate_block_rate": output_gate_block_rate,
         "output_gate_release_rate": output_gate_release_rate,
         "protect_box_coverage_iou50": protect_box_coverage,
+        "protect_box_containment90": protect_box_containment,
         "protected_gt_boxes": protected_gt_boxes,
+        "contained_gt_boxes": contained_gt_boxes,
         "total_protect_gt_boxes": total_protect_gt_boxes,
         "detection_calls_per_100_frames": detection_calls_per_100_frames,
         "average_detection_interval_frames": avg_detection_interval,
@@ -526,6 +582,7 @@ def run_sequence(
     unsafe = 0
     protected_gt_boxes = 0
     total_protect_gt_boxes = 0
+    contained_gt_boxes = 0
 
     psnr_sum = 0.0
     psnr_count = 0
@@ -539,6 +596,7 @@ def run_sequence(
     prev_frame_risk_level: str | None = None
 
     track_histories: dict[int, TrackHistory] = {}
+    risk_standardizer = SequenceStandardizer(len(FEATURES))
 
     tracker_args = SimpleNamespace(
         track_high_thresh=CONF_THRES,
@@ -694,8 +752,9 @@ def run_sequence(
                     gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                     feat["brightness"] = float(gray_crop.mean() / 255.0)
 
-            X = np.array([[feat[f] for f in FEATURES]], dtype=np.float32)
-            risk_prob = predict_risk(risk_model, X)
+            X = np.array([feat[f] for f in FEATURES], dtype=np.float32)
+            X_norm = risk_standardizer.transform(X).reshape(1, -1)
+            risk_prob = predict_risk(risk_model, X_norm)
             risk_y_prob.append(risk_prob)
             if risk_prob > frame_risk:
                 frame_risk = risk_prob
@@ -726,12 +785,17 @@ def run_sequence(
             for gb in gts:
                 total_protect_gt_boxes += 1
                 protected_any = False
+                contained_any = False
                 for pb in protect_boxes_frame:
-                    if iou(gb, pb) >= 0.5:
+                    if not protected_any and iou(gb, pb) >= 0.5:
                         protected_any = True
+                    if containment(gb, pb) >= 0.9:
+                        contained_any = True
                         break
                 if protected_any:
                     protected_gt_boxes += 1
+                if contained_any:
+                    contained_gt_boxes += 1
                 else:
                     frame_unsafe = True
             if frame_unsafe:
@@ -774,6 +838,7 @@ def run_sequence(
         "released": released,
         "unsafe": unsafe,
         "protected_gt_boxes": protected_gt_boxes,
+        "contained_gt_boxes": contained_gt_boxes,
         "total_protect_gt_boxes": total_protect_gt_boxes,
         "psnr_sum": psnr_sum,
         "psnr_count": psnr_count,
@@ -834,6 +899,7 @@ def main() -> None:
     total_released = 0
     total_unsafe = 0
     total_protected_gt_boxes = 0
+    total_contained_gt_boxes = 0
     total_protect_gt_boxes = 0
     total_psnr_sum = 0.0
     total_psnr_count = 0
@@ -876,6 +942,7 @@ def main() -> None:
         total_released += result["released"]
         total_unsafe += result["unsafe"]
         total_protected_gt_boxes += result["protected_gt_boxes"]
+        total_contained_gt_boxes += result["contained_gt_boxes"]
         total_protect_gt_boxes += result["total_protect_gt_boxes"]
         total_psnr_sum += result["psnr_sum"]
         total_psnr_count += result["psnr_count"]
@@ -889,7 +956,7 @@ def main() -> None:
         all_gt, all_pred, all_frames,
         all_latency, total_detection_calls,
         all_intervals, total_blocked, total_released,
-        total_protected_gt_boxes, total_protect_gt_boxes,
+        total_protected_gt_boxes, total_contained_gt_boxes, total_protect_gt_boxes,
         total_psnr_sum, total_psnr_count,
         total_ssim_sum, total_ssim_count,
         all_risk_y_true, all_risk_y_prob,
@@ -920,6 +987,7 @@ def main() -> None:
     print(f"[Bước 5] Detection recall: {metrics['detection_recall']:.4f}")
     print(f"[Bước 5] Detection F1: {metrics['detection_f1']:.4f}")
     print(f"[Bước 5] Protect-box coverage @ IoU 0.5: {metrics['protect_box_coverage_iou50']:.4f}")
+    print(f"[Bước 5] Protect-box containment @ 90%: {metrics['protect_box_containment90']:.4f}")
     print(f"[Bước 5] Avg PSNR (dB): {metrics['avg_psnr_db']:.2f}")
     print(f"[Bước 5] Avg SSIM: {metrics['avg_ssim']:.4f}")
     print(f"[Bước 5] Output gate block rate: {metrics['output_gate_block_rate']:.4f}")

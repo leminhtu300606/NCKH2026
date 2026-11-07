@@ -13,8 +13,13 @@ Cách xử lý trong script này:
    cân bằng; báo cả OOF AUC và AUC khi fit lại toàn bộ để thấy mức overfit.
 3. Giảm độ phức tạp của cây (max_depth/learning_rate/reg Lambda) để chống
    overfit, dùng scale_pos_weight theo tỷ lệ sau cân bằng.
-4. Chỉ ghi đè `models/xgboost_risk.json` (model runtime) và giữ bản backup
+4. Đánh giá thêm temporal hold-out: giữ các sequence cuối (theo thứ tự tên) làm
+   tập test hoàn toàn, không tham gia train/CV.
+5. Chỉ ghi đè `models/xgboost_risk.json` (model runtime) và giữ bản backup
    `models/xgboost_risk_baseline.json`.
+
+Ghi chú: đã thử soft label (1/rank, exp(-(rank-1)/5), hard*simconf) nhưng OOF
+AUC đều thấp hơn nhãn cứng (0.52-0.64 so với 0.65-0.69), nên giữ nhãn cứng.
 
 Chạy: python step_train_risk_model.py
 """
@@ -38,6 +43,8 @@ BASELINE_PATH = Path("models/xgboost_risk_baseline.json")
 SUMMARY_PATH = Path("results/risk_model_training_summary.json")
 
 NEG_POS_RATIO = 5.0
+HOLDOUT_FRACTION = 0.2
+MIN_NORM_SAMPLES = 50  # số vector tối thiểu trước khi chuẩn hóa (giống runtime)
 N_FOLDS = 5
 SEED = 42
 
@@ -71,14 +78,56 @@ XGB_PARAMS = dict(
 )
 
 
+def add_causal_sequence_zscore(df: pd.DataFrame, min_n: int = MIN_NORM_SAMPLES) -> np.ndarray:
+    """Chuẩn hóa z-score theo từng sequence, chỉ dùng các mẫu quá khứ.
+
+    Với mỗi sequence, duyệt các mẫu theo thứ tự thời gian (`window_start`,
+    `track_id`) và cập nhật mean/variance kiểu Welford. Mẫu đầu tiên (tối đa
+    `min_n`) giữ nguyên giá trị thô; các mẫu sau được chuẩn hóa bằng thống kê
+    của các mẫu trước đó — đúng với cách step5 cập nhật online lúc suy luận.
+    """
+    X = df[FEATURES].to_numpy(np.float64)
+    out = np.empty_like(X)
+    seq = df["sequence"].to_numpy()
+    order = np.lexsort((
+        df["track_id"].to_numpy(),
+        df["window_start"].to_numpy(),
+        seq,
+    ))
+    start, n = 0, len(order)
+    while start < n:
+        cur = seq[order[start]]
+        end = start
+        while end < n and seq[order[end]] == cur:
+            end += 1
+        mean = np.zeros(X.shape[1])
+        m2 = np.zeros(X.shape[1])
+        cnt = 0
+        for k in range(start, end):
+            i = order[k]
+            x = X[i]
+            cnt += 1
+            if cnt <= min_n:
+                out[i] = x
+            else:
+                var = m2 / (cnt - 1)
+                sd = np.sqrt(np.maximum(var, 1e-6))
+                out[i] = (x - mean) / sd
+            d = x - mean
+            mean = mean + d / cnt
+            m2 = m2 + d * (x - mean)
+        start = end
+    return out.astype(np.float32)
+
+
 def balance_labels(df: pd.DataFrame, ratio: float, seed: int) -> pd.DataFrame:
     """Undersample lớp âm để đạt tỷ lệ neg:pos xấp xỉ `ratio`."""
     pos = df[df.label == 1]
     neg = df[df.label == 0]
     n_neg = min(len(neg), int(round(len(pos) * ratio)))
     neg_sampled = neg.sample(n=n_neg, random_state=seed)
-    out = pd.concat([pos, neg_sampled], ignore_index=True)
-    return out.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    out = pd.concat([pos, neg_sampled], ignore_index=False)
+    return out.sample(frac=1.0, random_state=seed)
 
 
 def evaluate_group_cv(X, y, groups, params: dict, ratio: float) -> tuple[np.ndarray, list[dict]]:
@@ -122,6 +171,7 @@ def main() -> None:
     df = pd.read_csv(RISK_CSV)
     labeled = df[df["label"].notna()].copy()
     labeled["label"] = labeled["label"].astype(int)
+    labeled = labeled.reset_index(drop=True)
     missing = [f for f in FEATURES if f not in labeled.columns]
     if missing:
         raise ValueError(f"Thiếu đặc trưng: {missing}")
@@ -138,6 +188,12 @@ def main() -> None:
         f"dương: {int(balanced.label.sum())} ({balanced.label.mean():.2%})"
     )
 
+    # Chuẩn hóa causal z-score theo sequence (dùng đặc trưng đã chuẩn hóa để train)
+    print(f"Chuẩn hóa causal z-score theo sequence (min_n={MIN_NORM_SAMPLES})...")
+    X_norm = add_causal_sequence_zscore(labeled, MIN_NORM_SAMPLES)
+    balanced = balanced.copy()
+    balanced[FEATURES] = X_norm[balanced.index.to_numpy()]
+
     X = balanced[FEATURES].to_numpy(np.float32)
     y = balanced["label"].to_numpy(int)
     groups = balanced["sequence"].to_numpy()
@@ -148,7 +204,7 @@ def main() -> None:
     print(f"scale_pos_weight (sau cân bằng): {pos_weight:.3f}")
 
     print("GroupKFold theo sequence (đánh giá trên phân phối nhãn gốc):")
-    X_orig = labeled[FEATURES].to_numpy(np.float32)
+    X_orig = X_norm
     y_orig = labeled["label"].to_numpy(int)
     groups_orig = labeled["sequence"].to_numpy()
     oof, folds = evaluate_group_cv(X_orig, y_orig, groups_orig, params, NEG_POS_RATIO)
@@ -164,6 +220,31 @@ def main() -> None:
     gap = full_auc - oof_auc
     print(f"  AUC khi fit lại toàn bộ={full_auc:.4f} | chênh lệch overfit={gap:.4f}")
 
+    # ---- Temporal hold-out: các sequence cuối (theo tên) làm test hoàn toàn ----
+    seq_names = sorted(labeled["sequence"].unique())
+    n_hold = max(1, int(round(len(seq_names) * HOLDOUT_FRACTION)))
+    hold_seqs = set(seq_names[-n_hold:])
+    tr_df = balanced[~balanced["sequence"].isin(hold_seqs)]
+    te_df = labeled[labeled["sequence"].isin(hold_seqs)]
+    hold_auc = hold_pr_auc = None
+    if len(te_df) > 0 and te_df["label"].nunique() > 1 and len(tr_df) > 0:
+        hold_model = xgb.XGBClassifier(**{**params, "early_stopping_rounds": 30})
+        hold_model.fit(
+            tr_df[FEATURES].to_numpy(np.float32), tr_df["label"].to_numpy(int),
+            eval_set=[(te_df[FEATURES].to_numpy(np.float32), te_df["label"].to_numpy(int))],
+            verbose=False,
+        )
+        p_hold = hold_model.predict_proba(te_df[FEATURES].to_numpy(np.float32))[:, 1]
+        y_hold = te_df["label"].to_numpy(int)
+        hold_auc = float(roc_auc_score(y_hold, p_hold))
+        hold_pr_auc = float(average_precision_score(y_hold, p_hold))
+        print(
+            f"  Temporal hold-out ({len(hold_seqs)} sequence, {len(te_df)} mẫu): "
+            f"AUC={hold_auc:.4f} PR-AUC={hold_pr_auc:.4f}"
+        )
+    else:
+        print("  Temporal hold-out: bỏ qua (thiếu lớp hoặc thiếu mẫu).")
+
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     if MODEL_PATH.exists() and not BASELINE_PATH.exists():
         shutil.copy2(MODEL_PATH, BASELINE_PATH)
@@ -178,6 +259,7 @@ def main() -> None:
         "positives_original": int(labeled.label.sum()),
         "positive_rate_original": float(labeled.label.mean()),
         "neg_pos_ratio": NEG_POS_RATIO,
+        "normalization": f"causal per-sequence z-score (Welford, min_n={MIN_NORM_SAMPLES})",
         "evaluation": "GroupKFold theo sequence tren phan phoi nhan goc; chi can bang tap train trong moi fold",
         "n_balanced": int(len(balanced)),
         "positive_rate_balanced": float(balanced.label.mean()),
@@ -189,6 +271,11 @@ def main() -> None:
         "oof_pr_auc": oof_pr_auc,
         "full_fit_auc": full_auc,
         "overfit_gap": gap,
+        "holdout_fraction": HOLDOUT_FRACTION,
+        "holdout_sequences": sorted(hold_seqs),
+        "holdout_n_samples": int(len(te_df)),
+        "holdout_auc": hold_auc,
+        "holdout_pr_auc": hold_pr_auc,
     }
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     SUMMARY_PATH.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
