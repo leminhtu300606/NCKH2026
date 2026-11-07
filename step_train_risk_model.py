@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 from sklearn.model_selection import GroupKFold
 
 RISK_CSV = Path("zip_extract_full/artifacts/risk_dataset.csv")
@@ -41,9 +41,12 @@ BALANCED_CSV = Path("zip_extract_full/artifacts/risk_dataset_balanced.csv")
 MODEL_PATH = Path("models/xgboost_risk.json")
 BASELINE_PATH = Path("models/xgboost_risk_baseline.json")
 SUMMARY_PATH = Path("results/risk_model_training_summary.json")
+OOF_PATH = Path("results/risk_oof.csv")
+TAU_OUT = Path("config/tau_val.json")
 
 NEG_POS_RATIO = 3.0  # Giam ty le am:duong de giam overfit (5:1 -> 3:1)
 HOLDOUT_FRACTION = 0.2
+TARGET_FPR = 0.05  # Nguong tau duoc chon de FPR tren OOF <= 5%
 MIN_NORM_SAMPLES = 50  # so vector toi thieu truoc khi chuan hoa (giong runtime)
 N_FOLDS = 5
 SEED = 42
@@ -212,6 +215,52 @@ def main() -> None:
     oof_pr_auc = float(average_precision_score(y_orig, oof))
     print(f"  OOF AUC={oof_auc:.4f} | OOF PR-AUC={oof_pr_auc:.4f}")
 
+    # ---- Lưu OOF để tái lập threshold/tau và tính CI ----
+    OOF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    oof_df = labeled[["sample_id", "sequence", "label"]].copy()
+    oof_df["y_true"] = y_orig
+    oof_df["y_prob"] = oof
+    oof_df.to_csv(OOF_PATH, index=False, encoding="utf-8-sig")
+    print(f"  Đã lưu OOF: {OOF_PATH} ({len(oof_df)} mẫu)")
+
+    # ---- Chọn tau theo target FPR trên OOF (sequence-disjoint) ----
+    neg_scores = oof[y_orig == 0]
+    tau_fpr = float(np.quantile(neg_scores, 1.0 - TARGET_FPR)) if len(neg_scores) else 0.5
+    picked = (oof >= tau_fpr).astype(int)
+    tau_tpr = float(picked[y_orig == 1].mean()) if (y_orig == 1).any() else 0.0
+    tau_fpr_achieved = float(picked[y_orig == 0].mean()) if (y_orig == 0).any() else 0.0
+    fprs, tprs, thresholds = roc_curve(y_orig, oof)
+    youden_idx = int(np.argmax(tprs - fprs))
+    tau_youden = float(thresholds[youden_idx])
+    if not np.isfinite(tau_youden):
+        tau_youden = tau_fpr
+    TAU_OUT.parent.mkdir(parents=True, exist_ok=True)
+    TAU_OUT.write_text(
+        json.dumps(
+            {
+                "tau": tau_fpr,
+                "method": "target_fpr_oof",
+                "target_fpr": TARGET_FPR,
+                "achieved_tpr": tau_tpr,
+                "achieved_fpr": tau_fpr_achieved,
+                "tau_youden": tau_youden,
+                "youden_j": float(tprs[youden_idx] - fprs[youden_idx]),
+                "auc": oof_auc,
+                "pr_auc": oof_pr_auc,
+                "n_oof": int(len(oof)),
+                "n_positive": int((y_orig == 1).sum()),
+                "evaluation": "sequence-grouped OOF, causal features",
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"  Tau (target FPR={TARGET_FPR:.0%}): {tau_fpr:.4f} | "
+        f"TPR={tau_tpr:.4f} FPR={tau_fpr_achieved:.4f} | Youden={tau_youden:.4f}"
+    )
+
     final_params = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
     final_model = xgb.XGBClassifier(**final_params)
     final_model.fit(X, y, verbose=False)
@@ -269,6 +318,13 @@ def main() -> None:
         "folds": folds,
         "oof_auc": oof_auc,
         "oof_pr_auc": oof_pr_auc,
+        "tau": tau_fpr,
+        "tau_target_fpr": TARGET_FPR,
+        "tau_tpr": tau_tpr,
+        "tau_fpr_achieved": tau_fpr_achieved,
+        "tau_youden": tau_youden,
+        "oof_csv": str(OOF_PATH),
+        "tau_json": str(TAU_OUT),
         "full_fit_auc": full_auc,
         "overfit_gap": gap,
         "holdout_fraction": HOLDOUT_FRACTION,

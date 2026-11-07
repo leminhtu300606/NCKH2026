@@ -29,11 +29,15 @@ OUT_MD = Path("results/system_report.md")
 
 # metric_name -> (nhãn hiển thị, số chữ số thập phân)
 SYSTEM_METRICS = [
-    ("detection_precision", "Detection precision", 4),
-    ("detection_recall", "Detection recall", 4),
-    ("detection_f1", "Detection F1", 4),
-    ("protect_box_coverage_iou50", "Protect-box coverage @ IoU 0.5", 4),
-    ("protect_box_containment90", "Protect-box containment @ 90%", 4),
+    ("detection_precision", "YOLO detection precision", 4),
+    ("detection_recall", "YOLO detection recall", 4),
+    ("detection_f1", "YOLO detection F1", 4),
+    ("tracking_precision", "ByteTrack precision", 4),
+    ("tracking_recall", "ByteTrack recall", 4),
+    ("tracking_f1", "ByteTrack F1", 4),
+    ("protect_box_coverage_iou50", "Protect-box coverage @ IoU 0.5 (released frames)", 4),
+    ("protect_box_containment90", "Protect-box containment @ 90% (released frames)", 4),
+    ("effective_privacy_coverage", "Effective privacy coverage (blocked frames blacked out)", 4),
     ("avg_psnr_db", "PSNR (dB)", 2),
     ("avg_ssim", "SSIM", 4),
     ("output_gate_block_rate", "Output gate block rate", 4),
@@ -45,14 +49,23 @@ SYSTEM_METRICS = [
     ("latency_p95_ms", "Latency p95 (ms)", 2),
     ("latency_p99_ms", "Latency p99 (ms)", 2),
     ("detection_calls", "Detection calls", 0),
-    ("total_gt_boxes", "GT boxes", 0),
-    ("total_pred_boxes", "Predicted boxes", 0),
+    ("total_gt_boxes", "GT boxes (frames with detection)", 0),
+    ("total_gt_boxes_all", "GT boxes (all frames)", 0),
+    ("total_pred_boxes", "YOLO predicted boxes", 0),
+    ("total_tracking_pred_boxes", "ByteTrack output boxes", 0),
     ("protected_gt_boxes", "Protected GT boxes", 0),
+    ("blocked_gt_boxes", "GT boxes on fully blocked frames", 0),
     ("total_protect_gt_boxes", "Evaluated GT boxes (released frames)", 0),
+    ("risk_eval_available", "Risk eval available (0/1)", 0),
+    ("risk_auc", "Risk AUC", 4),
+    ("risk_pr_auc", "Risk PR-AUC", 4),
+    ("risk_brier", "Risk Brier", 4),
+    ("risk_ece", "Risk ECE", 4),
 ]
 
 HARDWARE_LABELS = {
     "detector": "Detector (YOLO)",
+    "detect_blur": "Detect + blur",
     "xgboost": "XGBoost risk model",
     "end_to_end": "End-to-end (detect + risk + blur)",
     "system": "System",
@@ -126,10 +139,26 @@ def main() -> None:
             ("Overfit gap (full - OOF)", rt.get("overfit_gap"), 4),
             ("Temporal hold-out AUC", rt.get("holdout_auc"), 4),
             ("Temporal hold-out PR-AUC", rt.get("holdout_pr_auc"), 4),
+            ("Tau OOF (target FPR)", rt.get("tau"), 4),
+            ("Tau target FPR", rt.get("tau_target_fpr"), 2),
+            ("Tau TPR đạt được", rt.get("tau_tpr"), 4),
+            ("Tau FPR đạt được", rt.get("tau_fpr_achieved"), 4),
+            ("Tau Youden", rt.get("tau_youden"), 4),
             ("Chuẩn hóa", rt.get("normalization"), 0),
         ]
         for label, value, digits in rows:
             lines.append(f"| {label} | {fmt(value, digits)} |")
+
+    lines += [
+        "",
+        "## Protocol",
+        "",
+        "- Person metric: VisDrone category 1, occlusion level 2 excluded, one-to-one matching per frame at IoU >= 0.5.",
+        "- YOLO detection metrics use raw detector boxes; ByteTrack metrics use tracker output boxes.",
+        "- Protection IoU coverage is conditional on released frames only; blocked frames are blacked out and are reported separately, not counted as IoU-covered boxes.",
+        "- Low detector confidence is used to prioritize coverage; false positives can cause substantial extra blur and lower precision.",
+        "- Thresholds were selected after a sweep on 715 labeled frames from these same 17 sequences; aggregate metrics are exploratory, not an independent holdout result.",
+    ]
 
     OUT_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))

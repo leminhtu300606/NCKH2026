@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,10 +28,12 @@ from typing import Any
 import cv2
 import numpy as np
 import pandas as pd
+from scipy.optimize import linear_sum_assignment
 import torch
 import xgboost as xgb
-from ultralytics import YOLO
 from ultralytics.trackers.byte_tracker import BYTETracker
+
+from onnx_detector import load_detector, resolve_backend
 
 try:
     import joblib
@@ -45,10 +48,10 @@ DATA_ROOT = Path("VisDrone2019-VID-test-dev")
 SEQUENCES_DIR = DATA_ROOT / "sequences"
 ANNOTATIONS_DIR = DATA_ROOT / "annotations"
 OUT_VIDEO = Path("outputs/protected_video.mp4")
-OUT_GATE_LOG = Path("results/output_gate_log.json")
-OUT_METRICS = Path("results/system_metrics_unified.csv")
+OUT_GATE_LOG = Path(os.getenv("NCKH_OUT_GATE_LOG", "results/output_gate_log.json"))
+OUT_METRICS = Path(os.getenv("NCKH_OUT_METRICS", "results/system_metrics_unified.csv"))
 COORDINATOR_RULES = Path("config/coordinator_rules.json")
-TAU_PATH = Path("zip_extract_full/artifacts/tau.json")
+TAU_PATH = Path("config/tau_val.json")
 
 FEATURES = [
     "conf", "conf_std5", "conf_delta", "track_age", "hit_ratio",
@@ -59,14 +62,24 @@ FEATURES = [
     "n_det_expected_ratio",
 ]
 
-IMG_SIZE = 640
+IMG_SIZE = 1024
 # Ghi video ra file là tùy chọn: tắt mặc định để tránh lỗi FFmpeg
 # "Failed to write frame" trên môi trường không có encoder tương thích.
 # Metrics (PSNR/SSIM) vẫn được tính trên frame đã che trong bộ nhớ.
 WRITE_VIDEO = False
-CONF_THRES = 0.05  # Giảm ngưỡng để tăng recall (phát hiện nhiều người hơn → bảo hộ nhiều hơn)
-IOU_THRES = 0.5
-MAX_FRAMES_PER_SEQ = 200
+CONF_THRES = 0.0075
+IOU_THRES = 0.7
+TRACK_HIGH_THRESH = 0.10
+TRACK_LOW_THRESH = 0.01
+TRACK_NEW_THRESH = 0.08
+TRACK_MATCH_THRESH = 0.8
+PROTECT_PADDING = 0.0
+# Cho phép chạy nhanh để so sánh backend mà không sửa code:
+#   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
+DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "auto")
+ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "models/best_raw_dyn.onnx"))
+MAX_SEQS = int(os.getenv("NCKH_MAX_SEQS", "0"))  # 0 = tất cả sequence
+MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "200"))
 WARMUP_FRAMES = 30
 
 CONF_WINDOW = 5
@@ -79,23 +92,29 @@ NEIGHBOR_K = 5
 CROP_RESIZE = 224
 SSIM_INTERVAL = 5
 
-DEVICE = "0" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 print(f"[Bước 5] Sử dụng thiết bị: {DEVICE} (CUDA: {torch.cuda.is_available()})")
 
 
 def load_tau() -> float:
+    """Ngưỡng tau chọn trên validation sequence-disjoint.
+
+    `config/tau_val.json` được sinh bởi step_train_risk_model.py theo target FPR.
+    Fallback 0.5 nếu chưa có, thay vì dùng artifact tau.json cũ (giá trị hỏng:
+    AUC < 0.5, n_val = 0).
+    """
     if TAU_PATH.exists():
         with TAU_PATH.open("r", encoding="utf-8") as f:
-            return float(json.load(f).get("tau", 0.4449612498283386))
-    return 0.4449612498283386
+            return float(json.load(f).get("tau", 0.5))
+    return 0.5
 
 
 def load_risk_model() -> Any:
     """Tải model calibration nếu hợp lệ, ngược lại fallback về XGBoost thô.
 
-    File `models/xgboost_risk_calibrated.joblib` trong artifact có thể bị hỏng
+    File models/xgboost_risk_calibrated.joblib trong artifact có thể bị hỏng
     (joblib báo "input stream corrupted"). Trường hợp đó chỉ ghi cảnh báo ngắn
-    gọn và dùng `models/xgboost_risk.json`.
+    gọn và dùng models/xgboost_risk.json.
     """
     if RISK_CALIBRATED_PATH.exists() and _HAS_JOBLIB:
         try:
@@ -125,8 +144,8 @@ NORM_MIN_SAMPLES = 50
 class SequenceStandardizer:
     """Chuẩn hóa z-score online theo sequence, chỉ dùng dữ liệu quá khứ.
 
-    Khớp với cách huấn luyện trong `step_train_risk_model.py`:
-    - `min_n` vector đầu tiên giữ nguyên giá trị thô;
+    Khớp với cách huấn luyện trong step_train_risk_model.py:
+    - min_n vector đầu tiên giữ nguyên giá trị thô;
     - các vector sau chuẩn hóa bằng mean/std của các vector trước đó (Welford).
     Nhờ vậy model không bị lệch phân phối giữa các sequence (domain shift).
     """
@@ -168,8 +187,8 @@ def load_annotations(seq_name: str) -> dict[int, list[list[float]]]:
             frame = int(parts[0])
             x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
             category = int(parts[7])
-            ignore = int(parts[9])
-            if category != 1 or ignore == 1:
+            occlusion = int(parts[9])
+            if category != 1 or occlusion == 2:
                 continue
             gt.setdefault(frame, []).append([x, y, x + w, y + h])
     return gt
@@ -218,17 +237,20 @@ def expand_box(box: list[float], padding: float, img_w: int, img_h: int) -> list
 
 
 def blur_boxes(frame: np.ndarray, boxes: list[list[float]]) -> np.ndarray:
-    out = frame.copy()
-    h, w = out.shape[:2]
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
     for box in boxes:
         x1, y1, x2, y2 = [int(v) for v in box]
         x1 = max(0, min(x1, w - 1))
         y1 = max(0, min(y1, h - 1))
         x2 = max(x1 + 1, min(x2, w))
         y2 = max(y1 + 1, min(y2, h))
-        crop = out[y1:y2, x1:x2]
-        if crop.size > 0:
-            out[y1:y2, x1:x2] = cv2.GaussianBlur(crop, (51, 51), 0)
+        mask[y1:y2, x1:x2] = 1
+    if not mask.any():
+        return frame.copy()
+    blurred = cv2.GaussianBlur(frame, (51, 51), 0)
+    out = frame.copy()
+    out[mask.astype(bool)] = blurred[mask.astype(bool)]
     return out
 
 
@@ -273,8 +295,9 @@ def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, bins: int =
 
 
 def compute_metrics(
-    gt_all: dict[str, list[list[float]]],
-    pred_all: dict[str, list[list[float]]],
+    gt_all: dict[str, dict[int, list[list[float]]]],
+    pred_all: dict[str, dict[int, list[list[float]]]],
+    detector_all: dict[str, dict[int, list[list[float]]]],
     frames_all: dict[str, int],
     latency_samples: list[float],
     detection_calls: int,
@@ -291,41 +314,49 @@ def compute_metrics(
     risk_y_true: list[int] | None = None,
     risk_y_prob: list[float] | None = None,
 ) -> dict[str, Any]:
-    total_gt = 0
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-
-    for seq in gt_all:
-        gts = gt_all[seq]
-        preds = pred_all.get(seq, [])
-        total_gt += len(gts)
-        matched_gt = set()
-        tp = 0
-        fp = 0
-        for pb in preds:
-            best_iou = 0.0
-            best_idx = -1
-            for i, gb in enumerate(gts):
-                if i in matched_gt:
+    def box_metrics(
+        predictions: dict[str, dict[int, list[list[float]]]],
+        only_predicted_frames: bool = False,
+    ) -> tuple[float, float, float, int, int]:
+        total_gt = total_tp = total_fp = 0
+        for seq, seq_gt in gt_all.items():
+            seq_pred = predictions.get(seq, {})
+            for frame_number, gts in seq_gt.items():
+                # Với YOLO: chỉ chấm trên frame thực sự gọi detect, nếu không
+                # scheduler giãn lịch sẽ làm recall detector thấp giả tạo.
+                if only_predicted_frames and frame_number not in seq_pred:
                     continue
-                iou_val = iou(pb, gb)
-                if iou_val > best_iou:
-                    best_iou = iou_val
-                    best_idx = i
-            if best_iou >= 0.5 and best_idx >= 0:
-                tp += 1
-                matched_gt.add(best_idx)
-            else:
-                fp += 1
-        fn = len(gts) - tp
-        total_tp += tp
-        total_fp += fp
-        total_fn += fn
+                preds = seq_pred.get(frame_number, [])
+                total_gt += len(gts)
+                if not gts or not preds:
+                    total_fp += len(preds)
+                    continue
+                ious = np.array(
+                    [[iou(pred, gt) for gt in gts] for pred in preds],
+                    dtype=np.float64,
+                )
+                match_cost = np.where(ious >= 0.5, -1.0 - ious * 1e-6, 0.0)
+                pred_indices, gt_indices = linear_sum_assignment(match_cost)
+                matched = sum(ious[p, g] >= 0.5 for p, g in zip(pred_indices, gt_indices))
+                total_tp += int(matched)
+                total_fp += len(preds) - int(matched)
+        total_fn = total_gt - total_tp
+        precision = total_tp / max(1, total_tp + total_fp)
+        recall = total_tp / max(1, total_gt)
+        f1 = 2 * precision * recall / max(1e-9, precision + recall)
+        return precision, recall, f1, total_gt, total_tp + total_fp
 
-    detection_precision = total_tp / max(1, total_tp + total_fp)
-    detection_recall = total_tp / max(1, total_tp + total_fn)
-    detection_f1 = 2 * detection_precision * detection_recall / max(1e-9, detection_precision + detection_recall)
+    detection_precision, detection_recall, detection_f1, total_gt, total_pred = box_metrics(
+        detector_all, only_predicted_frames=True
+    )
+    tracking_precision, tracking_recall, tracking_f1, _, total_tracking_pred = box_metrics(
+        pred_all
+    )
+    # Tổng GT trên mọi frame (kể cả frame scheduler bỏ qua detect), dùng cho
+    # blocked/effective coverage để không phụ thuộc lịch detect.
+    total_gt_all = sum(
+        len(boxes) for seq_gt in gt_all.values() for boxes in seq_gt.values()
+    )
 
     avg_psnr = psnr_sum / max(1, psnr_count) if psnr_count > 0 else 0.0
     avg_ssim = ssim_sum / max(1, ssim_count) if ssim_count > 0 else 0.0
@@ -339,8 +370,15 @@ def compute_metrics(
     protect_box_coverage = protected_gt_boxes / max(1, total_protect_gt_boxes)
     # Tỷ lệ GT box được protect box che >= 90% diện tích (đúng bản chất ROI padding).
     protect_box_containment = contained_gt_boxes / max(1, total_protect_gt_boxes)
+    blocked_gt_boxes = max(0, total_gt_all - total_protect_gt_boxes)
+    effective_privacy_coverage = (
+        protected_gt_boxes + blocked_gt_boxes
+    ) / max(1, total_gt_all)
 
-    fps_wall = len(latency_samples) / max(1e-9, sum(latency_samples)) if latency_samples else 0.0
+    fps_wall = (
+        1000.0 * len(latency_samples) / max(1e-9, sum(latency_samples))
+        if latency_samples else 0.0
+    )
     latency_arr = np.array(latency_samples) if latency_samples else np.array([0.0])
 
     risk_auc = None
@@ -374,12 +412,17 @@ def compute_metrics(
         "detection_precision": detection_precision,
         "detection_recall": detection_recall,
         "detection_f1": detection_f1,
+        "tracking_precision": tracking_precision,
+        "tracking_recall": tracking_recall,
+        "tracking_f1": tracking_f1,
         "avg_psnr_db": avg_psnr,
         "avg_ssim": avg_ssim,
         "output_gate_block_rate": output_gate_block_rate,
         "output_gate_release_rate": output_gate_release_rate,
         "protect_box_coverage_iou50": protect_box_coverage,
         "protect_box_containment90": protect_box_containment,
+        "blocked_gt_boxes": blocked_gt_boxes,
+        "effective_privacy_coverage": effective_privacy_coverage,
         "protected_gt_boxes": protected_gt_boxes,
         "contained_gt_boxes": contained_gt_boxes,
         "total_protect_gt_boxes": total_protect_gt_boxes,
@@ -391,7 +434,9 @@ def compute_metrics(
         "latency_p99_ms": float(np.percentile(latency_arr, 99)),
         "detection_calls": detection_calls,
         "total_gt_boxes": total_gt,
-        "total_pred_boxes": total_tp + total_fp,
+        "total_gt_boxes_all": total_gt_all,
+        "total_pred_boxes": total_pred,
+        "total_tracking_pred_boxes": total_tracking_pred,
         "risk_auc": risk_auc,
         "risk_pr_auc": risk_pr_auc,
         "risk_accuracy": risk_accuracy,
@@ -400,6 +445,7 @@ def compute_metrics(
         "risk_f1": risk_f1,
         "risk_brier": risk_brier,
         "risk_ece": risk_ece,
+        "risk_eval_available": int(risk_auc is not None),
     }
     return metrics
 
@@ -553,24 +599,51 @@ def classify_risk_level(risk: float, rules: dict[str, Any]) -> str:
     return "low"
 
 
-def should_block_output_direct(risk: float, rules: dict[str, Any]) -> bool:
-    return risk >= rules.get("output_gate_block_threshold", 0.75)
+def decide_roi_padding(risk: float, rules: dict[str, Any]) -> float:
+    """Padding vùng bảo vệ theo mức rủi ro (ROI expansion thích ứng).
+
+    Đây là phần `roi_expand_*` trong config trước đây bị bỏ qua vì runtime
+    luôn dùng PROTECT_PADDING = 0.0.
+    """
+    level = classify_risk_level(risk, rules)
+    default = {"low": 0.10, "medium": 0.20, "high": 0.30, "critical": 0.50}[level]
+    padding = float(rules.get(f"roi_expand_{level}", default))
+    return max(PROTECT_PADDING, padding)
+
+
+def should_block_output_direct(
+    risk: float, rules: dict[str, Any], tau: float | None = None
+) -> bool:
+    """Chặn frame nếu risk vượt ngưỡng config.
+
+    `tau` chỉ dùng làm fallback khi config thiếu ngưỡng. Không dùng tau làm
+    gate chính vì OOF tau (0.54) không transfer sang VisDrone test-dev
+    (domain shift): áp tau trực tiếp làm chặn ~47% frame.
+    """
+    config_threshold = rules.get("output_gate_block_threshold")
+    if config_threshold is None:
+        config_threshold = tau if tau is not None else 0.75
+    return risk >= float(config_threshold)
 
 
 def run_sequence(
     seq_name: str,
-    model: YOLO,
+    model: Any,
     risk_model: Any,
     tau: float,
     coordinator_rules: dict[str, Any],
     writer: cv2.VideoWriter | None,
     max_frames: int,
+    device: str = "cpu",
+    half: bool = False,
 ) -> dict[str, Any]:
     seq_dir = SEQUENCES_DIR / seq_name
     images = sorted(seq_dir.glob("*.jpg"))[:max_frames]
     gt = load_annotations(seq_name)
 
-    pred_boxes: list[list[float]] = []
+    pred_boxes_by_frame: dict[int, list[list[float]]] = {}
+    detector_boxes_by_frame: dict[int, list[list[float]]] = {}
+    gt_boxes_by_frame: dict[int, list[list[float]]] = {}
     risks: list[float] = []
     risk_y_true: list[int] = []
     risk_y_prob: list[float] = []
@@ -599,11 +672,11 @@ def run_sequence(
     risk_standardizer = SequenceStandardizer(len(FEATURES))
 
     tracker_args = SimpleNamespace(
-        track_high_thresh=CONF_THRES,
-        track_low_thresh=0.05,
-        new_track_thresh=CONF_THRES,
+        track_high_thresh=TRACK_HIGH_THRESH,
+        track_low_thresh=TRACK_LOW_THRESH,
+        new_track_thresh=TRACK_NEW_THRESH,
         track_buffer=TRACK_BUFFER_FRAMES,
-        match_thresh=0.7,
+        match_thresh=TRACK_MATCH_THRESH,
         fuse_score=True,
     )
     tracker = BYTETracker(tracker_args)
@@ -638,31 +711,24 @@ def run_sequence(
         )
         detection_intervals.append(float(det_interval))
 
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
         if should_detect:
-            results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=DEVICE, verbose=False)
+            results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=device, half=half, verbose=False)
             detection_calls += 1
             last_detect_frame = frame_idx
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            det_array = []
-            lap_vars: dict[int, float] = {}
-            for r in results:
-                for box in r.boxes or []:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    conf = float(box.conf[0])
-                    det_array.append([x1, y1, x2, y2, conf, 0.0])
-                    idx = len(det_array) - 1
-                    crop = gray[int(max(0, y1)):int(min(h, y2)), int(max(0, x1)):int(min(w, x2))]
-                    lap_vars[idx] = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size > 0 else 0.0
-
-            detections_np = np.array(det_array, dtype=np.float32) if det_array else np.empty((0, 6), dtype=np.float32)
+            cpu_boxes = results[0].cpu().boxes
+            xyxy = cpu_boxes.xyxy.numpy()
+            confs = cpu_boxes.conf.numpy()
+            detections_np = (
+                np.column_stack((xyxy, confs, np.zeros_like(confs))).astype(np.float32)
+                if len(xyxy) else np.empty((0, 6), dtype=np.float32)
+            )
         else:
             detections_np = np.empty((0, 6), dtype=np.float32)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            lap_vars = {}
 
         if should_detect:
-            tracker_out = tracker.update(results[0].boxes, frame)
+            tracker_out = tracker.update(results[0].cpu().boxes, frame)
         else:
             class _EmptyBoxes:
                 def __init__(self):
@@ -705,8 +771,12 @@ def run_sequence(
                         if iou_val > best_iou:
                             best_iou = iou_val
                             best_idx = i
-                    if best_idx >= 0 and best_idx in lap_vars:
-                        lap_var = lap_vars[best_idx]
+                    if best_idx >= 0:
+                        x1, y1, x2, y2 = [int(v) for v in detections_np[best_idx, :4]]
+                        x1 = max(0, min(x1, w - 1)); y1 = max(0, min(y1, h - 1))
+                        x2 = max(x1 + 1, min(x2, w)); y2 = max(y1 + 1, min(y2, h))
+                        crop = gray[y1:y2, x1:x2]
+                        lap_var = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size > 0 else 0.0
                 else:
                     lap_var = th.lap_history[-1] if th.lap_history else 0.0
 
@@ -728,7 +798,6 @@ def run_sequence(
         all_boxes_frame = track_boxes
         frame_risk = 0.0
 
-        max_risk_prob = 0.0
         for tid, th in track_histories.items():
             if tid not in current_ids:
                 continue
@@ -756,28 +825,20 @@ def run_sequence(
             X = np.array([feat[f] for f in FEATURES], dtype=np.float32)
             X_norm = risk_standardizer.transform(X).reshape(1, -1)
             risk_prob = predict_risk(risk_model, X_norm)
-            if risk_prob > max_risk_prob:
-                max_risk_prob = risk_prob
-
-        risk_y_prob.append(max_risk_prob)
-        frame_risk = max_risk_prob
+            risk_y_prob.append(risk_prob)
+            if risk_prob > frame_risk:
+                frame_risk = risk_prob
 
         risks.append(frame_risk)
         prev_frame_risk_level = classify_risk_level(frame_risk, coordinator_rules)
 
-        roi_padding = {
-            "critical": coordinator_rules.get("roi_expand_critical", 0.50),
-            "high": coordinator_rules.get("roi_expand_high", 0.30),
-            "medium": coordinator_rules.get("roi_expand_medium", 0.20),
-            "low": coordinator_rules.get("roi_expand_low", 0.10),
-        }.get(prev_frame_risk_level, coordinator_rules.get("roi_expand_low", 0.10))
-        protect_boxes_frame = []
-        for box in track_boxes:
-            pbox = expand_box(box, roi_padding, w, h)
-            protect_boxes_frame.append(pbox)
+        candidate_boxes = detections_np[:, :4].tolist() if should_detect else track_boxes
+        roi_padding = decide_roi_padding(frame_risk, coordinator_rules)
+        protect_boxes_frame = [
+            expand_box(box, roi_padding, w, h) for box in candidate_boxes
+        ]
 
-        block = should_block_output_direct(frame_risk, coordinator_rules)
-        frame_unsafe = False
+        block = should_block_output_direct(frame_risk, coordinator_rules, tau)
         if block:
             blocked += 1
             out_frame = np.zeros_like(frame)
@@ -790,10 +851,15 @@ def run_sequence(
                 total_protect_gt_boxes += 1
                 protected_any = False
                 contained_any = False
-                for pb in protect_boxes_frame:
-                    if not protected_any and iou(gb, pb) >= 0.5:
+                # IoU coverage: đo trên box detector/tracker TRƯỚC padding,
+                # đúng protocol trong README.
+                for pb in candidate_boxes:
+                    if iou(gb, pb) >= 0.5:
                         protected_any = True
-                    if containment(gb, pb) >= 0.9:
+                        break
+                # Containment: đo trên box ĐÃ padding (vùng thực sự bị che).
+                for cb in protect_boxes_frame:
+                    if containment(gb, cb) >= 0.9:
                         contained_any = True
                         break
                 if protected_any:
@@ -804,12 +870,14 @@ def run_sequence(
                     frame_unsafe = True
             if frame_unsafe:
                 unsafe += 1
-            risk_y_true.append(1 if (block or frame_unsafe) else 0)
 
         if writer is not None:
             writer.write(out_frame)
 
-        pred_boxes.extend(track_boxes)
+        if should_detect:
+            detector_boxes_by_frame[frame_number] = detections_np[:, :4].tolist()
+        pred_boxes_by_frame[frame_number] = track_boxes
+        gt_boxes_by_frame[frame_number] = gt.get(frame_number, [])
 
         try:
             psnr_val = compute_psnr(frame, out_frame)
@@ -832,7 +900,9 @@ def run_sequence(
         frame_idx += 1
 
     return {
-        "pred_boxes": pred_boxes,
+        "pred_boxes_by_frame": pred_boxes_by_frame,
+        "detector_boxes_by_frame": detector_boxes_by_frame,
+        "gt_boxes_by_frame": gt_boxes_by_frame,
         "risks": risks,
         "risk_y_true": risk_y_true,
         "risk_y_prob": risk_y_prob,
@@ -862,8 +932,14 @@ def main() -> None:
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy mô hình XGBoost: {RISK_MODEL_PATH}")
 
-    model = YOLO(str(WEIGHTS_PATH))
-    model.to(DEVICE)
+    model = load_detector(DETECTOR_BACKEND, WEIGHTS_PATH, ONNX_MODEL_PATH, IMG_SIZE)
+    det_kind, det_device = resolve_backend(DETECTOR_BACKEND)
+    detector_half = (
+        det_kind == "pt"
+        and det_device.startswith("cuda")
+        and os.getenv("NCKH_HALF", "1") == "1"
+    )
+    print(f"[Bước 5] Detector backend: {det_kind} | device: {det_device} | half: {detector_half}")
     risk_model = load_risk_model()
     tau = load_tau()
 
@@ -890,9 +966,12 @@ def main() -> None:
     sequences = sorted(
         [d.name for d in SEQUENCES_DIR.iterdir() if d.is_dir()]
     )
+    if MAX_SEQS > 0:
+        sequences = sequences[:MAX_SEQS]
 
-    all_gt: dict[str, list[list[float]]] = {}
-    all_pred: dict[str, list[list[float]]] = {}
+    all_gt: dict[str, dict[int, list[list[float]]]] = {}
+    all_pred: dict[str, dict[int, list[list[float]]]] = {}
+    all_detector: dict[str, dict[int, list[list[float]]]] = {}
     all_frames: dict[str, int] = {}
     all_risks: dict[str, list[float]] = {}
     all_latency: list[float] = []
@@ -931,12 +1010,15 @@ def main() -> None:
                 writer.release()
                 writer = None
 
-        result = run_sequence(seq, model, risk_model, tau, coordinator_rules, writer, MAX_FRAMES_PER_SEQ)
+        result = run_sequence(
+            seq, model, risk_model, tau, coordinator_rules, writer,
+            MAX_FRAMES_PER_SEQ, det_device, detector_half,
+        )
 
-        gt = load_annotations(seq)
-        all_gt[seq] = [box for boxes in gt.values() for box in boxes]
-        all_pred[seq] = result["pred_boxes"]
-        all_frames[seq] = len(images)
+        all_gt[seq] = result["gt_boxes_by_frame"]
+        all_pred[seq] = result["pred_boxes_by_frame"]
+        all_detector[seq] = result["detector_boxes_by_frame"]
+        all_frames[seq] = len(result["pred_boxes_by_frame"])
         all_risks[seq] = result["risks"]
         all_latency.extend(result["latency_samples"])
         all_intervals.extend(result["detection_intervals"])
@@ -958,7 +1040,7 @@ def main() -> None:
         writer.release()
 
     metrics = compute_metrics(
-        all_gt, all_pred, all_frames,
+        all_gt, all_pred, all_detector, all_frames,
         all_latency, total_detection_calls,
         all_intervals, total_blocked, total_released,
         total_protected_gt_boxes, total_contained_gt_boxes, total_protect_gt_boxes,
@@ -988,9 +1070,12 @@ def main() -> None:
     else:
         print("[Bước 5] Bỏ qua ghi video (WRITE_VIDEO=False), vẫn tính metric trên frame đã che.")
     print(f"[Bước 5] Đã lưu chỉ số đánh giá: {OUT_METRICS}")
-    print(f"[Bước 5] Detection precision: {metrics['detection_precision']:.4f}")
-    print(f"[Bước 5] Detection recall: {metrics['detection_recall']:.4f}")
-    print(f"[Bước 5] Detection F1: {metrics['detection_f1']:.4f}")
+    print(f"[Bước 5] YOLO precision: {metrics['detection_precision']:.4f}")
+    print(f"[Bước 5] YOLO recall: {metrics['detection_recall']:.4f}")
+    print(f"[Bước 5] YOLO F1: {metrics['detection_f1']:.4f}")
+    print(f"[Bước 5] Tracking precision: {metrics['tracking_precision']:.4f}")
+    print(f"[Bước 5] Tracking recall: {metrics['tracking_recall']:.4f}")
+    print(f"[Bước 5] Tracking F1: {metrics['tracking_f1']:.4f}")
     print(f"[Bước 5] Protect-box coverage @ IoU 0.5: {metrics['protect_box_coverage_iou50']:.4f}")
     print(f"[Bước 5] Protect-box containment @ 90%: {metrics['protect_box_containment90']:.4f}")
     print(f"[Bước 5] Avg PSNR (dB): {metrics['avg_psnr_db']:.2f}")
@@ -1003,4 +1088,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
