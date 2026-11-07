@@ -1,0 +1,14 @@
+{
+  "tau": 0.5264542698860168,
+  "method": "target_fpr_oof",
+  "target_fpr": 0.05,
+  "achieved_tpr": 0.1785872945357619,
+  "achieved_fpr": 0.06067087485001826,
+  "tau_youden": 0.48908647894859314,
+  "youden_j": 0.3704965645076241,
+  "auc": 0.6877960338237694,
+  "pr_auc": 0.10390001567536193,
+  "n_oof": 40589,
+  "n_positive": 2251,
+  "evaluation": "sequence-grouped OOF, causal features"
+}

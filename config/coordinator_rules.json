@@ -10,5 +10,5 @@
   "roi_expand_medium": 0.2,
   "roi_expand_high": 0.3,
   "roi_expand_critical": 0.5,
-  "output_gate_block_threshold": 0.85
+  "output_gate_block_threshold": 0.526
 }

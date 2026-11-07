@@ -66,9 +66,10 @@ FEATURES = [
 IMG_SIZE = 1024
 # Ghi video ra file là tùy chọn: tắt mặc định để tránh lỗi FFmpeg
 # "Failed to write frame" trên môi trường không có encoder tương thích.
-# Metrics (PSNR/SSIM) vẫn được tính trên frame đã che trong bộ nhớ.
+# Metrics (PSNR/SSIM) chỉ được tính trên frame ĐÃ PHÁT HÀNH (released), không tính
+# trên frame bị gate chắn (mảng đen) để PSNR/SSIM phản ánh chất lượng vùng che thực tế.
 WRITE_VIDEO = False
-CONF_THRES = 0.05
+CONF_THRES = 0.25
 IOU_THRES = 0.7
 TRACK_HIGH_THRESH = 0.10
 TRACK_LOW_THRESH = 0.01
@@ -77,7 +78,7 @@ TRACK_MATCH_THRESH = 0.8
 PROTECT_PADDING = 0.0
 # Cho phép chạy nhanh để so sánh backend mà không sửa code:
 #   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
-DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "auto")
+DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "pytorch")
 ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "models/best_raw_dyn.onnx"))
 MAX_SEQS = int(os.getenv("NCKH_MAX_SEQS", "0"))  # 0 = tất cả sequence
 MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "200"))
@@ -156,14 +157,21 @@ def load_risk_labels_lookup() -> dict:
         )
         return lookup
     df = pd.read_csv(RISK_DATASET_PATH)
+    n_skipped = 0
     for _, row in df.iterrows():
+        if pd.isna(row.get("label")):
+            n_skipped += 1
+            continue
         seq = str(row["sequence"])
         ws = int(row["window_start"])
         we = int(row["window_end"])
         lbl = int(row["label"])
         for f in range(ws, we + 1):
             lookup.setdefault((seq, f), []).append(lbl)
-    print(f"[Bước 5] Đã tải nhãn rủi ro cho {len(lookup)} (sequence, frame) từ {RISK_DATASET_PATH}")
+    print(
+        f"[Bước 5] Đã tải nhãn rủi ro cho {len(lookup)} (sequence, frame) từ {RISK_DATASET_PATH} "
+        f"(bỏ qua {n_skipped} dòng không có nhãn)"
+    )
     return lookup
 
 
@@ -1026,21 +1034,23 @@ def run_sequence(
         pred_boxes_by_frame[frame_number] = track_boxes
         gt_boxes_by_frame[frame_number] = gt.get(frame_number, [])
 
-        try:
-            psnr_val = compute_psnr(frame, out_frame)
-            if math.isfinite(psnr_val):
-                psnr_sum += psnr_val
-                psnr_count += 1
-        except Exception:
-            pass
-
-        if frame_idx % SSIM_INTERVAL == 0:
+        # Chỉ đo chất lượng vùng che trên frame ĐÃ PHÁT HÀNH (không tính frame bị chắn đen).
+        if not block:
             try:
-                ssim_val = compute_ssim(frame, out_frame)
-                ssim_sum += ssim_val
-                ssim_count += 1
+                psnr_val = compute_psnr(frame, out_frame)
+                if math.isfinite(psnr_val):
+                    psnr_sum += psnr_val
+                    psnr_count += 1
             except Exception:
                 pass
+
+            if frame_idx % SSIM_INTERVAL == 0:
+                try:
+                    ssim_val = compute_ssim(frame, out_frame)
+                    ssim_sum += ssim_val
+                    ssim_count += 1
+                except Exception:
+                    pass
 
         latency_ms = (time.perf_counter() - wall_start) * 1000.0
         latency_samples.append(latency_ms)
@@ -1079,11 +1089,18 @@ def main() -> None:
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy mô hình XGBoost: {RISK_MODEL_PATH}")
 
-    model = YOLO(str(WEIGHTS_PATH))
-    model.to(DEVICE)
+    backend = DETECTOR_BACKEND.lower()
     det_device = DEVICE
     detector_half = False
-    print(f"[Bước 5] Detector backend: pytorch | device: {DEVICE} | half: False")
+    if backend in ("onnx", "openvino"):
+        print(
+            f"[Bước 5] Cảnh báo: backend '{backend}' chưa triển khai inference riêng "
+            "trong Bước 5, fallback PyTorch."
+        )
+        backend = "pytorch"
+    model = YOLO(str(WEIGHTS_PATH))
+    model.to(DEVICE)
+    print(f"[Bước 5] Detector backend: {backend} | device: {DEVICE} | half: {detector_half}")
     risk_model = load_risk_model()
     tau = load_tau()
     risk_labels_lookup = load_risk_labels_lookup()

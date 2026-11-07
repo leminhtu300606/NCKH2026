@@ -5,9 +5,8 @@
 Hệ thống nhận video UAV, phát hiện người, theo dõi đối tượng, ước lượng rủi ro
 nhận dạng lại, chọn mức bảo vệ, che vùng nhạy cảm và chỉ phát hành frame qua
 OutputGate sau khi xác minh. Đây là pipeline nghiên cứu trên *người (person)* trong
-VisDrone; detector hiện tại là *model person*, *không phải* detector khuôn mặt hoặc
-biển số. Toàn bộ dữ liệu train/val/test và toàn bộ metric đánh giá đều được tính trên
-hộp bounding box *person*, không dùng nhãn mặt hoặc biển số.
+VisDrone; detector hiện tại là *model person*. Toàn bộ dữ liệu train/val/test và toàn bộ metric đánh giá đều được tính trên
+hộp bounding box *person*.
 
 Luồng xử lý chính:
 
@@ -31,12 +30,12 @@ B1 đến B8 là các operating point của cùng pipeline:
 
 ## Thành phần và dữ liệu
 
-- [models/best.pt](models/best.pt): detector *person* (không phải face/license plate).
+- [models/best.pt](models/best.pt): detector *person*.
 - [models/xgboost_risk.json](models/xgboost_risk.json): XGBoost artifact
   từ archive, với 21 feature, train trên dữ liệu *person*.
 - [zip_extract_full/artifacts](zip_extract_full/artifacts): risk dataset, OOF predictions,
   feature schema, CV summary và metric gốc trong ZIP; toàn bộ sample là
-  *person track*, không có face/license plate.
+  *person track*.
 - [zip_extract_full/artifacts/risk_model.json.metadata.json](zip_extract_full/artifacts/risk_model.json.metadata.json):
   thứ tự feature bắt buộc khi phục vụ model.
 - [zip_extract_full/artifacts/feature_schema.json](zip_extract_full/artifacts/feature_schema.json): định nghĩa
@@ -45,7 +44,7 @@ B1 đến B8 là các operating point của cùng pipeline:
   validation sequence-disjoint.
 - [VisDrone2019-VID-test-dev](VisDrone2019-VID-test-dev): dataset đánh giá chuẩn,
   gồm 17 sequence, có sequences/ và annotations/; annotation chỉ chứa
-  *person box* (category 1), không có face/license plate.
+  *person box* (category 1).
 - [visdrone-train](visdrone-train): dữ liệu dùng để xây detector export, không
   phải bảng feature huấn luyện XGBoost; chỉ dùng cho detector *person*.
 
@@ -79,17 +78,20 @@ loại annotation có occlusion == 2. Đây là benchmark kiến trúc end-to-en
 không cộng hoặc trộn kết quả từ các thư mục bước riêng lẻ.
 
 Hai script step5_integrated_system.py và step6_hardware_benchmark.py dùng
-IMG_SIZE=1280, confidence 0.0075, NMS IoU 0.70 để ưu tiên phát hiện người
-nhỏ/xa. Bước 5 dùng ByteTrack với high/low/new-track thresholds
-0.10/0.01/0.08, match threshold 0.90 và score fusion bật. Detection và
+IMG_SIZE=1024, confidence 0.25, NMS IoU 0.70 để cân bằng precision/recall
+trên detector người. Bước 5 dùng ByteTrack với high/low/new-track thresholds
+0.10/0.01/0.08, match threshold 0.80 và score fusion bật. Detection và
 tracking precision/recall/F1 được tính độc lập, ghép một-một trong cùng frame
 ở IoU 0.5; chỉ category pedestrian (1) được chấm và annotation occlusion 2
 bị loại. Đây là operating point recall-first: precision có thể giảm, nên cần
 đọc cả hai metric. Bước 5 dùng box ứng viên detector (kèm track khi bỏ qua
 detect) làm vùng blur; IoU coverage được đo trên box trước padding và chỉ trên
-GT ở frame được phát hành. Threshold rất thấp làm tăng false positive và diện
-tích video bị blur; không diễn giải coverage conditional này như recall chuẩn
-của detector. Với cấu hình hiện tại, coverage trên lần chạy 17 sequence là
+GT ở frame được phát hành. Confidence 0.25 giúp giảm false positive và diện
+tích video bị blur so với ngưỡng rất thấp; không diễn giải coverage conditional
+này như recall chuẩn của detector. PSNR/SSIM chỉ được tính trên frame được
+phát hành (không tính frame bị gate chắn đen) để phản ánh chất lượng vùng che
+thực tế.
+Với cấu hình hiện tại, coverage trên lần chạy 17 sequence là
 0.7073; precision YOLO là 0.0892, và 54.14% frame bị output gate chặn.
 Coverage có điều kiện trên frame phát hành; nếu tính các GT nằm trong frame
 bị chặn đen là được bảo vệ hoàn toàn, effective privacy coverage là 0.9619.
@@ -103,31 +105,22 @@ Môi trường Windows/Python 3.15 đã kiểm tra với RTX 3050 và PyTorch CU
 python -m pip install torch==2.14.1+cu130 torchvision==0.29.1+cu130 `
   --index-url https://download.pytorch.org/whl/cu130
 
-Có thể benchmark detector ONNX sau khi export:
+### Backend detector (Bước 5)
 
-python run_step6.py --backend onnx --weights edge_models\best.onnx
-
-Hệ thống từ chối cấu hình ONNX nếu checkpoint không có đuôi .onnx; TensorRT
-và công suất/energy chỉ được báo cáo khi môi trường có runtime hoặc cảm biến
-tương ứng.
-
-### Backend detector ONNX / OpenVINO (FP32, không lượng tử hóa INT8)
-
-Đã export lại ONNX **raw head** `(1, 5, anchors)` để NMS chạy ngoài graph, và
-thêm 3 backend cho Bước 5 qua biến môi trường `NCKH_BACKEND`:
+Hiện Bước 5 chỉ triển khai inference PyTorch. Biến `NCKH_BACKEND` được giữ để
+chọn backend trong tương lai; nếu đặt `onnx` hoặc `openvino` mà chưa triển khai,
+script sẽ in cảnh báo và fallback về PyTorch:
 
 ```powershell
 python step5_integrated_system.py                                  # PyTorch (mặc định)
-$env:NCKH_BACKEND="onnx";     python step5_integrated_system.py    # ONNX Runtime + NMS ngoài
-$env:NCKH_BACKEND="openvino"; python step5_integrated_system.py    # OpenVINO static 736x1280
+$env:NCKH_BACKEND="onnx";     python step5_integrated_system.py    # fallback PyTorch (cảnh báo)
+$env:NCKH_BACKEND="openvino"; python step5_integrated_system.py    # fallback PyTorch (cảnh báo)
 ```
 
-- `models/best_raw_dyn.onnx`: ONNX dynamic H/W, raw head, dùng cho
-  `NCKH_BACKEND=onnx` (Ultralytics dùng letterbox rect nên input thật là
-  736x1280, không phải 1280x1280).
-- `models/best_raw.onnx`: ONNX static 1280x1280, chỉ dùng để tham chiếu.
-- Chỉnh nhanh phạm vi đánh giá: `NCKH_MAX_SEQS`, `NCKH_MAX_FRAMES`,
-  `NCKH_OUT_METRICS`, `NCKH_OUT_GATE_LOG`.
+Các file ONNX (`models/best_raw_dyn.onnx`, `models/best_raw.onnx`) chỉ giữ
+làm tham chiếu cho Bước 6 / xuất mô hình; chưa dùng trực tiếp trong Bước 5.
+Chỉnh nhanh phạm vi đánh giá: `NCKH_MAX_SEQS`, `NCKH_MAX_FRAMES`,
+`NCKH_OUT_METRICS`, `NCKH_OUT_GATE_LOG`.
 
 Đo round-robin trên 1 frame thật (1360x765), 20 lần, FP32, cùng conf 0.0075 /
 IoU 0.7: PyTorch 493.6 ms, ONNX + IOBinding 439.2 ms, OpenVINO 363.3 ms.
@@ -146,7 +139,7 @@ chênh confidence tuyệt đối 0.00024, precision/recall/F1 gần như trùng.
 - Khi cần đo upper-bound, có thể bật B8 recall_first để dùng vùng bảo vệ toàn
   khung. Đây không phải cấu hình triển khai vì làm mất tính hữu dụng của video.
 - *ULFR*: tỷ lệ frame còn ít nhất một ground-truth box chưa được phủ; thấp hơn
-  là tốt hơn. Đây là coverage-only, chưa bao gồm mọi khả năng Re-ID/OCR.
+  là tốt hơn. Đây là coverage-only.
 - *Unsafe release*: frame được phát hành nhưng còn box chưa phủ; đây là
   coverage-proxy, khác với gate violation.
 - *TTP p50/p95*: số frame từ lúc identity xuất hiện đến lần đầu được bảo vệ;
@@ -157,18 +150,14 @@ chênh confidence tuyệt đối 0.00024, precision/recall/F1 gần như trùng.
   hành, tách biệt với chất lượng detector.
 - *Re-ID attack/protection success, PSNR, SSIM*: hiệu quả và chất lượng vùng
   che khi oracle Re-ID được chạy.
-- **Face Recognition Accuracy, Rank-1, TAR, FAR, EER, OCR Exact Match Accuracy,
-  CER, MS-SSIM, LPIPS, FID**: chưa đánh giá vì hệ thống chỉ sử dụng dữ liệu
-  *person*, không có face identity hoặc license-plate/OCR ground truth và
-  chưa có evaluator tương ứng. Không đánh giá face/license plate vì không nằm
-  trong phạm vi dữ liệu.
+- Các chỉ số nhận dạng đối tượng khác ngoài người không nằm trong phạm vi đánh giá vì hệ thống chỉ sử dụng dữ liệu *person*.
 - *XGBoost AUC, PR-AUC, Brier, F1 và ECE*: chất lượng risk model trên split
   sequence-disjoint; đây là metric của model, không thay thế metric end-to-end.
 - *Energy/frame* chỉ có ý nghĩa khi đo bằng cảm biến công suất đã hiệu chuẩn.
 
 ## Giới hạn và cách diễn giải
 
-1. Detector là detector *person* nên toàn bộ bảo vệ nhạy cảm là proxy; *chỉ dùng dữ liệu person*, không dùng face hoặc license plate; chưa chứng minh cho mặt hoặc biển số.
+1. Detector là detector *person* nên toàn bộ bảo vệ nhạy cảm là proxy; *chỉ dùng dữ liệu person*.
 2. Kết quả detector/tracking trên VisDrone2019-VID-test-dev chỉ có ý nghĩa
    trong split này; không được gọi là kết quả production hoặc edge GPU.
 3. Latency hiện đo trên CPU. overload-ms=250 là ngưỡng đo cho máy này, không
@@ -180,7 +169,7 @@ chênh confidence tuyệt đối 0.00024, precision/recall/F1 gần như trùng.
    khi có lại dữ liệu gốc.
 6. ROI_DETECTION trong benchmark hiện dùng detection toàn frame từ cache; số
    lần gọi ROI vì vậy không chứng minh mức tiết kiệm GPU thực tế.
-7. ULFR coverage-only không phát hiện trường hợp đã phủ nhưng Re-ID/OCR vẫn nhận
+7. ULFR coverage-only không phát hiện trường hợp đã phủ nhưng Re-ID vẫn nhận
    đúng. Đánh giá riêng tư mạnh hơn cần nhãn hoặc oracle cross-sequence hợp lệ.
 8. Các sequence/frame local có thể trùng với dữ liệu detector dùng để xây model;
    không dùng chúng để tuyên bố holdout độc lập nếu chưa kiểm tra hash và nguồn
@@ -190,5 +179,4 @@ chênh confidence tuyệt đối 0.00024, precision/recall/F1 gần như trùng.
 
 ## Kiểm tra nhanh
 
-python test_step6.py
-python -c "import xgboost as xgb; m=xgb.XGBClassifier(); m.load_model('edge_models/risk_model.json'); print(m.n_features_in_)"
+python -c "import xgboost as xgb; m=xgb.XGBClassifier(); m.load_model('models/xgboost_risk.json'); print(m.n_features_in_)"

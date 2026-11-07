@@ -15,6 +15,8 @@ venv/
 *.onnx
 *.engine
 *.joblib
+# Model artifacts (khong commit weights/khu bau mo hinh)
+models/*.json
 
 # Dataset & extracted archives (large)
 VisDrone2019-VID-test-dev/
@@ -29,7 +31,9 @@ outputs/
 results/
 *.mp4
 *.csv
-*.json
+# Bo quasar JSON kết quả tạo ra, nhưng GIU config/*.json (tau_val.json, coordinator_rules.json)
+results/*.json
+outputs/*.json
 
 # IDE / OS
 .vscode/

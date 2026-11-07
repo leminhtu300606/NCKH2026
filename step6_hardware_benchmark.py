@@ -29,7 +29,7 @@ RISK_MODEL_PATH = Path("models/xgboost_risk.json")
 OUT_CSV = Path("results/hardware_benchmark.csv")
 
 IMG_SIZE = 1024
-CONF_THRES = 0.05
+CONF_THRES = 0.25
 IOU_THRES = 0.7
 WARMUP = 10
 MEASURE = 100
@@ -63,14 +63,17 @@ def main() -> None:
     ]
 
     process = psutil.Process()
-    # Dùng frame thật để latency phản ánh dữ liệu triển khai; fallback frame đen.
+    # Dùng frame thật nếu có để latency phản ánh dữ liệu triển khai; nếu không
+    # tìm thấy, dùng frame ngẫu nhiên (không phải frame đen) để latency phản ánh
+    # chi phí xử lý trên ảnh có nội dung thay vì ảnh đồng màu.
     real_frame = Path("VisDrone2019-VID-test-dev/sequences/uav0000009_03358_v/0000001.jpg")
     if real_frame.exists():
         frame = cv2.imread(str(real_frame))
         print(f"[Bước 6] Dùng frame thật: {real_frame} shape={frame.shape}")
     else:
-        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        print("[Bước 6] Cảnh báo: không tìm thấy frame thật, dùng frame đen tổng hợp.")
+        rng = np.random.default_rng(42)
+        frame = rng.integers(0, 256, size=(720, 1280, 3), dtype=np.uint8)
+        print("[Bước 6] Cảnh báo: không tìm thấy frame thật, dùng frame ngẫu nhiên thay thế.")
 
     # Warm-up
     for _ in range(WARMUP):
