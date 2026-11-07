@@ -22,7 +22,7 @@ import pandas as pd
 import psutil
 import torch
 import xgboost as xgb
-from onnx_detector import load_detector, resolve_backend
+from ultralytics import YOLO
 
 WEIGHTS_PATH = Path("models/best.pt")
 RISK_MODEL_PATH = Path("models/xgboost_risk.json")
@@ -45,16 +45,11 @@ def main() -> None:
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy {RISK_MODEL_PATH}")
 
-    model = load_detector("auto", WEIGHTS_PATH)
-    det_kind, det_device = resolve_backend("auto")
-    det_half = (
-        det_kind == "pt"
-        and det_device.startswith("cuda")
-        and os.getenv("NCKH_HALF", "1") == "1"
-    )
-    print(
-        f"[Bước 6] Detector backend: {det_kind} | device: {det_device} | half: {det_half}"
-    )
+    model = YOLO(str(WEIGHTS_PATH))
+    model.to(DEVICE)
+    det_device = DEVICE
+    det_half = False
+    print(f"[Bước 6] Detector backend: pytorch | device: {DEVICE} | half: False")
     risk_model = xgb.XGBClassifier()
     risk_model.load_model(str(RISK_MODEL_PATH))
 

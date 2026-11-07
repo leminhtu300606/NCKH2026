@@ -33,7 +33,7 @@ import torch
 import xgboost as xgb
 from ultralytics.trackers.byte_tracker import BYTETracker
 
-from onnx_detector import load_detector, resolve_backend
+from ultralytics import YOLO
 
 try:
     import joblib
@@ -932,14 +932,11 @@ def main() -> None:
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy mô hình XGBoost: {RISK_MODEL_PATH}")
 
-    model = load_detector(DETECTOR_BACKEND, WEIGHTS_PATH, ONNX_MODEL_PATH, IMG_SIZE)
-    det_kind, det_device = resolve_backend(DETECTOR_BACKEND)
-    detector_half = (
-        det_kind == "pt"
-        and det_device.startswith("cuda")
-        and os.getenv("NCKH_HALF", "1") == "1"
-    )
-    print(f"[Bước 5] Detector backend: {det_kind} | device: {det_device} | half: {detector_half}")
+    model = YOLO(str(WEIGHTS_PATH))
+    model.to(DEVICE)
+    det_device = DEVICE
+    detector_half = False
+    print(f"[Bước 5] Detector backend: pytorch | device: {DEVICE} | half: False")
     risk_model = load_risk_model()
     tau = load_tau()
 
