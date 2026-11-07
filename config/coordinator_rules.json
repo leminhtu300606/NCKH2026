@@ -1,14 +1,14 @@
 {
-  "risk_low": 0.03460954874753952,
-  "risk_high": 0.5,
+  "risk_low": 0.25,
+  "risk_high": 0.50,
   "risk_critical": 0.75,
   "detect_interval_low": 1,
   "detect_interval_medium": 1,
   "detect_interval_high": 1,
   "detect_interval_critical": 1,
-  "roi_expand_low": 0.2,
-  "roi_expand_medium": 0.3,
-  "roi_expand_high": 0.5,
-  "roi_expand_critical": 0.7,
-  "output_gate_block_threshold": 0.6
+  "roi_expand_low": 0.3,
+  "roi_expand_medium": 0.5,
+  "roi_expand_high": 0.7,
+  "roi_expand_critical": 0.9,
+  "output_gate_block_threshold": 0.5
 }

@@ -64,7 +64,7 @@ IMG_SIZE = 640
 # "Failed to write frame" trên môi trường không có encoder tương thích.
 # Metrics (PSNR/SSIM) vẫn được tính trên frame đã che trong bộ nhớ.
 WRITE_VIDEO = False
-CONF_THRES = 0.15
+CONF_THRES = 0.05  # Giảm ngưỡng để tăng recall (phát hiện nhiều người hơn → bảo hộ nhiều hơn)
 IOU_THRES = 0.5
 MAX_FRAMES_PER_SEQ = 200
 WARMUP_FRAMES = 30
@@ -728,6 +728,7 @@ def run_sequence(
         all_boxes_frame = track_boxes
         frame_risk = 0.0
 
+        max_risk_prob = 0.0
         for tid, th in track_histories.items():
             if tid not in current_ids:
                 continue
@@ -755,9 +756,11 @@ def run_sequence(
             X = np.array([feat[f] for f in FEATURES], dtype=np.float32)
             X_norm = risk_standardizer.transform(X).reshape(1, -1)
             risk_prob = predict_risk(risk_model, X_norm)
-            risk_y_prob.append(risk_prob)
-            if risk_prob > frame_risk:
-                frame_risk = risk_prob
+            if risk_prob > max_risk_prob:
+                max_risk_prob = risk_prob
+
+        risk_y_prob.append(max_risk_prob)
+        frame_risk = max_risk_prob
 
         risks.append(frame_risk)
         prev_frame_risk_level = classify_risk_level(frame_risk, coordinator_rules)
@@ -774,6 +777,7 @@ def run_sequence(
             protect_boxes_frame.append(pbox)
 
         block = should_block_output_direct(frame_risk, coordinator_rules)
+        frame_unsafe = False
         if block:
             blocked += 1
             out_frame = np.zeros_like(frame)
@@ -800,6 +804,7 @@ def run_sequence(
                     frame_unsafe = True
             if frame_unsafe:
                 unsafe += 1
+            risk_y_true.append(1 if (block or frame_unsafe) else 0)
 
         if writer is not None:
             writer.write(out_frame)

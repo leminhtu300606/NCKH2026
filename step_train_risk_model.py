@@ -42,9 +42,9 @@ MODEL_PATH = Path("models/xgboost_risk.json")
 BASELINE_PATH = Path("models/xgboost_risk_baseline.json")
 SUMMARY_PATH = Path("results/risk_model_training_summary.json")
 
-NEG_POS_RATIO = 5.0
+NEG_POS_RATIO = 3.0  # Giam ty le am:duong de giam overfit (5:1 -> 3:1)
 HOLDOUT_FRACTION = 0.2
-MIN_NORM_SAMPLES = 50  # số vector tối thiểu trước khi chuẩn hóa (giống runtime)
+MIN_NORM_SAMPLES = 50  # so vector toi thieu truoc khi chuan hoa (giong runtime)
 N_FOLDS = 5
 SEED = 42
 
@@ -61,14 +61,14 @@ FEATURES = [
 # Depth 2 + tỷ lệ âm:dương 5:1 cho OOF AUC tốt nhất trong lưới thử nghiệm
 # (0.624 so với 0.514 của cấu hình gốc, đo trên cùng GroupKFold).
 XGB_PARAMS = dict(
-    n_estimators=300,
+    n_estimators=200,        # Giam so cay de chong overfit
     max_depth=2,
     learning_rate=0.03,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    min_child_weight=5,
-    reg_lambda=5.0,
-    reg_alpha=0.5,
+    subsample=0.7,           # Giam de chong overfit
+    colsample_bytree=0.7,    # Giam de chong overfit
+    min_child_weight=10,     # Tang de chong overfit
+    reg_lambda=10.0,         # Tang L2 regularization
+    reg_alpha=1.0,           # Tang L1 regularization
     objective="binary:logistic",
     eval_metric="aucpr",
     tree_method="hist",

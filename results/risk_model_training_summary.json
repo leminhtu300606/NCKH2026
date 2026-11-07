@@ -4,74 +4,74 @@
   "n_labeled_original": 40589,
   "positives_original": 2251,
   "positive_rate_original": 0.05545837542191234,
-  "neg_pos_ratio": 5.0,
+  "neg_pos_ratio": 3.0,
   "normalization": "causal per-sequence z-score (Welford, min_n=50)",
   "evaluation": "GroupKFold theo sequence tren phan phoi nhan goc; chi can bang tap train trong moi fold",
-  "n_balanced": 13506,
-  "positive_rate_balanced": 0.16666666666666666,
+  "n_balanced": 9004,
+  "positive_rate_balanced": 0.25,
   "n_groups": 35,
   "params": {
-    "n_estimators": 300,
+    "n_estimators": 200,
     "max_depth": 2,
     "learning_rate": 0.03,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 5,
-    "reg_lambda": 5.0,
-    "reg_alpha": 0.5,
+    "subsample": 0.7,
+    "colsample_bytree": 0.7,
+    "min_child_weight": 10,
+    "reg_lambda": 10.0,
+    "reg_alpha": 1.0,
     "objective": "binary:logistic",
     "eval_metric": "aucpr",
     "tree_method": "hist",
     "random_state": 42,
-    "scale_pos_weight": 5.000000000000001
+    "scale_pos_weight": 3.0
   },
-  "scale_pos_weight": 5.000000000000001,
+  "scale_pos_weight": 3.0,
   "folds": [
     {
       "fold": 0,
-      "n_train": 5304,
+      "n_train": 3536,
       "n_val": 10452,
-      "auc": 0.6619122253898098,
-      "pr_auc": 0.21802572773420034,
+      "auc": 0.6422473437288005,
+      "pr_auc": 0.2248246506661349,
       "best_iteration": 10
     },
     {
       "fold": 1,
-      "n_train": 12090,
+      "n_train": 8060,
       "n_val": 7533,
-      "auc": 0.7472559538050231,
-      "pr_auc": 0.11200209182053682,
-      "best_iteration": 10
+      "auc": 0.670569284335564,
+      "pr_auc": 0.08484095293026099,
+      "best_iteration": 6
     },
     {
       "fold": 2,
-      "n_train": 11886,
+      "n_train": 7924,
       "n_val": 7537,
-      "auc": 0.637409344117752,
-      "pr_auc": 0.05522668877123898,
-      "best_iteration": 37
+      "auc": 0.6427791283784128,
+      "pr_auc": 0.053458852949917396,
+      "best_iteration": 40
     },
     {
       "fold": 3,
-      "n_train": 12150,
+      "n_train": 8100,
       "n_val": 7535,
-      "auc": 0.7286358677687952,
-      "pr_auc": 0.07285115335217866,
+      "auc": 0.757713244793363,
+      "pr_auc": 0.07291098981821087,
       "best_iteration": 2
     },
     {
       "fold": 4,
-      "n_train": 12594,
+      "n_train": 8396,
       "n_val": 7532,
-      "auc": 0.6816801276565397,
-      "pr_auc": 0.059710629973164384,
-      "best_iteration": 29
+      "auc": 0.6833600770218229,
+      "pr_auc": 0.03673620778472643,
+      "best_iteration": 20
     }
   ],
-  "oof_auc": 0.674676025185878,
-  "oof_pr_auc": 0.10291024360224606,
-  "full_fit_auc": 0.9252295726160299,
-  "overfit_gap": 0.2505535474301519,
+  "oof_auc": 0.6891684567062188,
+  "oof_pr_auc": 0.10706577602293317,
+  "full_fit_auc": 0.9042490757523294,
+  "overfit_gap": 0.21508061904611053,
   "holdout_fraction": 0.2,
   "holdout_sequences": [
     "uav0000295_02300_v",
@@ -83,6 +83,6 @@
     "uav0000355_00001_v"
   ],
   "holdout_n_samples": 2930,
-  "holdout_auc": 0.7189484827099506,
-  "holdout_pr_auc": 0.056838365896980464
+  "holdout_auc": 0.7101325423429781,
+  "holdout_pr_auc": 0.058668342979197985
 }
