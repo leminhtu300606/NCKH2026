@@ -30,11 +30,52 @@ import json
 import shutil
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score, roc_curve
 from sklearn.model_selection import GroupKFold
+
+
+class _RiskCalibrator:
+    """Gói IsotonicRegression để ánh xác probability thô ra xác suất đã calibrate.
+
+    Sau fit, chỉ giữ hai mảng numpy (`X_thresholds_`, `y_values_`) để có thể
+    serialize bằng joblib mà không phụ thuộc lớp tùy chỉnh khi nạp lại ở bước
+    suy luận (step5).
+    """
+
+    def __init__(self):
+        self.calib_fn = None
+        self.X_thresholds_ = None
+        self.y_values_ = None
+
+    def fit(self, prob, y):
+        prob = np.asarray(prob, dtype=float)
+        y = np.asarray(y, dtype=int)
+        self.calib_fn = IsotonicRegression(out_of_bounds="clip")
+        self.calib_fn.fit(prob, y)
+        self.X_thresholds_ = np.asarray(self.calib_fn.X_thresholds_, dtype=float)
+        self.y_values_ = np.asarray(self.calib_fn.y_thresholds_, dtype=float)
+        return self
+
+    def transform(self, prob):
+        if self.X_thresholds_ is None:
+            return np.asarray(prob, dtype=float)
+        prob = np.asarray(prob, dtype=float)
+        return np.clip(np.interp(prob, self.X_thresholds_, self.y_values_), 0.0, 1.0)
+
+
+def expected_calibration_error(y_true, prob, bins: int = 10) -> float:
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (prob >= lo) & (prob < hi if hi < 1 else prob <= hi)
+        if mask.any():
+            ece += float(mask.mean()) * abs(float(prob[mask].mean()) - float(y_true[mask].mean()))
+    return ece
 
 RISK_CSV = Path("zip_extract_full/artifacts/risk_dataset.csv")
 BALANCED_CSV = Path("zip_extract_full/artifacts/risk_dataset_balanced.csv")
@@ -215,6 +256,20 @@ def main() -> None:
     oof_pr_auc = float(average_precision_score(y_orig, oof))
     print(f"  OOF AUC={oof_auc:.4f} | OOF PR-AUC={oof_pr_auc:.4f}")
 
+    # ---- Calibrate xác suất trên OOF (sequence-disjoint, không rò rỉ) ----
+    ece_raw = expected_calibration_error(y_orig, oof)
+    brier_raw = float(brier_score_loss(y_orig, oof))
+    calibrator = _RiskCalibrator()
+    calibrator.fit(oof, y_orig)
+    oof_cal = calibrator.transform(oof)
+    ece_cal = expected_calibration_error(y_orig, oof_cal)
+    brier_cal = float(brier_score_loss(y_orig, oof_cal))
+    auc_cal = float(roc_auc_score(y_orig, oof_cal)) if len(np.unique(y_orig)) > 1 else float("nan")
+    print(
+        f"  Calibration OOF: ECE {ece_raw:.4f}->{ece_cal:.4f} | "
+        f"Brier {brier_raw:.4f}->{brier_cal:.4f} | AUC {oof_auc:.4f}->{auc_cal:.4f}"
+    )
+
     # ---- Lưu OOF để tái lập threshold/tau và tính CI ----
     OOF_PATH.parent.mkdir(parents=True, exist_ok=True)
     oof_df = labeled[["sample_id", "sequence", "label"]].copy()
@@ -315,6 +370,24 @@ def main() -> None:
     final_model.save_model(str(MODEL_PATH))
     print(f"Đã lưu model mới: {MODEL_PATH}")
 
+    # ---- Lưu mô hình đã calibrate (joblib) để step5 sử dụng ----
+    CALIBRATED_PATH = Path("models/xgboost_risk_calibrated.joblib")
+    CALIBRATED_PATH.parent.mkdir(parents=True, exist_ok=True)
+    calib_payload = {
+        "model": final_model,
+        "calibrator": {
+            "X_thresholds_": calibrator.X_thresholds_,
+            "y_values_": calibrator.y_values_,
+        },
+        "features": FEATURES,
+        "ece_raw": ece_raw,
+        "ece_calibrated": ece_cal,
+        "brier_raw": brier_raw,
+        "brier_calibrated": brier_cal,
+    }
+    joblib.dump(calib_payload, str(CALIBRATED_PATH))
+    print(f"Đã lưu model đã calibrate: {CALIBRATED_PATH}")
+
     summary = {
         "source_csv": str(RISK_CSV),
         "balanced_csv": str(BALANCED_CSV),
@@ -346,6 +419,12 @@ def main() -> None:
         "holdout_n_samples": int(len(te_df)),
         "holdout_auc": hold_auc,
         "holdout_pr_auc": hold_pr_auc,
+        "ece_raw": ece_raw,
+        "ece_calibrated": ece_cal,
+        "brier_raw": brier_raw,
+        "brier_calibrated": brier_cal,
+        "auc_calibrated_oof": auc_cal,
+        "calibrated_path": str(CALIBRATED_PATH),
     }
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     SUMMARY_PATH.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")

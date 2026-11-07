@@ -121,7 +121,13 @@ def load_risk_model() -> Any:
     if RISK_CALIBRATED_PATH.exists() and _HAS_JOBLIB:
         try:
             cal = joblib.load(str(RISK_CALIBRATED_PATH))
-            print(f"[Bước 5] Đã tải mô hình đã calibration: {RISK_CALIBRATED_PATH}")
+            if isinstance(cal, dict) and "model" in cal and "calibrator" in cal:
+                print(
+                    f"[Bước 5] Đã tải mô hình đã calibrate (ECE raw={cal.get('ece_raw', float('nan')):.4f} "
+                    f"-> cal={cal.get('ece_calibrated', float('nan')):.4f}): {RISK_CALIBRATED_PATH}"
+                )
+            else:
+                print(f"[Bước 5] Đã tải mô hình đã calibration: {RISK_CALIBRATED_PATH}")
             return cal
         except Exception:
             print(
@@ -135,7 +141,23 @@ def load_risk_model() -> Any:
 
 
 def predict_risk(risk_model: Any, X: np.ndarray) -> float:
-    """Dự đoán xác suất rủi ro cho một vector đặc trưng."""
+    """Dự đoán xác suất rủi ro cho một vector đặc trưng.
+
+    Hỗ trợ cả mô hình XGBoost thô và payload đã calibrate
+    {'model': XGBClassifier, 'calibrator': _RiskCalibrator, ...}.
+    """
+    if isinstance(risk_model, dict) and "model" in risk_model:
+        raw_prob = float(risk_model["model"].predict_proba(X)[0, 1])
+        cal = risk_model.get("calibrator")
+        if cal is not None and "X_thresholds_" in cal and "y_values_" in cal:
+            return float(
+                np.clip(
+                    np.interp(raw_prob, np.asarray(cal["X_thresholds_"]), np.asarray(cal["y_values_"])),
+                    0.0,
+                    1.0,
+                )
+            )
+        return raw_prob
     return float(risk_model.predict_proba(X)[0, 1])
 
 

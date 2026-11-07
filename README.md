@@ -153,6 +153,10 @@ chênh confidence tuyệt đối 0.00024, precision/recall/F1 gần như trùng.
 - Các chỉ số nhận dạng đối tượng khác ngoài người không nằm trong phạm vi đánh giá vì hệ thống chỉ sử dụng dữ liệu *person*.
 - *XGBoost AUC, PR-AUC, Brier, F1 và ECE*: chất lượng risk model trên split
   sequence-disjoint; đây là metric của model, không thay thế metric end-to-end.
+  Mô hình runtime được calibrate bằng Isotonic Regression trên OOF
+  sequence-disjoint (lưu tại `models/xgboost_risk_calibrated.joblib`), giúp
+  xác suất rủi ro gần xác suất thực hơn (ECE/Brier giảm rõ) và được đánh giá
+  thêm trên temporal hold-out sequence-disjoint.
 - *Energy/frame* chỉ có ý nghĩa khi đo bằng cảm biến công suất đã hiệu chuẩn.
 
 ## Giới hạn và cách diễn giải
