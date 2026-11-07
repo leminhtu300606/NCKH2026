@@ -1,0 +1,31 @@
+# =============================================================================
+# Dependencies cho hệ thống bảo vệ riêng tư video UAV (NCKH2026)
+# Người khác pull code về chỉ cần chạy:  pip install -r requirements.txt
+# =============================================================================
+
+# PyTorch (phiên bản hiện tại là CPU-only trên máy phát triển)
+# Nếu máy đích có GPU NVIDIA, hãy cài torch bản CUDA từ https://pytorch.org
+torch==2.15.0+cpu
+torchvision==0.29.2+cpu
+
+# Detector YOLO
+ultralytics==8.4.197
+
+# ONNX / OpenVINO (dùng cho backend ONNX Runtime và OpenVINO FP32)
+onnxruntime==1.31.1
+onnx==1.23.2
+onnxslim==0.1.98
+openvino==2026.4.1          # Tuỳ chọn: chỉ cần nếu dùng backend OpenVINO
+
+# Xử lý ảnh / số liệu
+opencv-python==5.0.0.93
+numpy==2.5.4
+pandas==3.1.0
+scipy==1.18.1
+
+# Mô hình rủi ro XGBoost + đánh giá metric
+xgboost==3.4.1
+scikit-learn==1.9.1
+
+# Thông tin hệ thống (RAM, CPU)
+psutil==7.2.2
