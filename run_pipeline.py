@@ -7,8 +7,6 @@ import sys
 from pathlib import Path
 
 STEPS = [
-    ("Bước 3: Dự đoán rủi ro XGBoost", "step3_use_risk_model.py"),
-    ("Bước 4: Bộ điều phối thích ứng", "step4_adaptive_coordinator.py"),
     ("Bước 5: Tích hợp hệ thống hoàn chỉnh", "step5_integrated_system.py"),
     ("Bước 6: Đo hiệu năng phần cứng", "step6_hardware_benchmark.py"),
 ]

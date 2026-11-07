@@ -31,17 +31,17 @@ B1 đến B8 là các operating point của cùng pipeline:
 
 ## Thành phần và dữ liệu
 
-- [edge_models/yolo26s.pt](edge_models/yolo26s.pt): detector *person* (không phải face/license plate).
-- [edge_models/risk_model.json](edge_models/risk_model.json): XGBoost artifact
+- [models/best.pt](models/best.pt): detector *person* (không phải face/license plate).
+- [models/xgboost_risk.json](models/xgboost_risk.json): XGBoost artifact
   từ archive, với 21 feature, train trên dữ liệu *person*.
-- [data/canonical_zip](data/canonical_zip): risk dataset, OOF predictions,
+- [zip_extract_full/artifacts](zip_extract_full/artifacts): risk dataset, OOF predictions,
   feature schema, CV summary và metric gốc trong ZIP; toàn bộ sample là
   *person track*, không có face/license plate.
-- [edge_models/risk_model.json.metadata.json](edge_models/risk_model.json.metadata.json):
+- [zip_extract_full/artifacts/risk_model.json.metadata.json](zip_extract_full/artifacts/risk_model.json.metadata.json):
   thứ tự feature bắt buộc khi phục vụ model.
-- [edge_models/feature_schema.json](edge_models/feature_schema.json): định nghĩa
+- [zip_extract_full/artifacts/feature_schema.json](zip_extract_full/artifacts/feature_schema.json): định nghĩa
   feature, tất cả mô tả đặc trưng *person track*.
-- [edge_models/tau_val.json](edge_models/tau_val.json): ngưỡng được chọn trên
+- [config/tau_val.json](config/tau_val.json): ngưỡng được chọn trên
   validation sequence-disjoint.
 - [VisDrone2019-VID-test-dev](VisDrone2019-VID-test-dev): dataset đánh giá chuẩn,
   gồm 17 sequence, có sequences/ và annotations/; annotation chỉ chứa
@@ -49,38 +49,29 @@ B1 đến B8 là các operating point của cùng pipeline:
 - [visdrone-train](visdrone-train): dữ liệu dùng để xây detector export, không
   phải bảng feature huấn luyện XGBoost; chỉ dùng cho detector *person*.
 
-risk_dataset.csv trong [data/canonical_zip](data/canonical_zip) là bảng dữ
+risk_dataset.csv trong [zip_extract_full/artifacts](zip_extract_full/artifacts) là bảng dữ
 liệu huấn luyện/đánh giá được đóng gói trong ZIP. Archive ghi nhận tracking
 chưa hoàn tất (completed=false, 52/80 sequence), nên metric risk archive
 được báo cáo đúng trạng thái và không được trộn với metric video end-to-end.
 
 ## Đánh giá toàn hệ thống
 
-Lệnh chuẩn đánh giá tất cả sequence và tất cả policy:
+Lệnh chuẩn chạy Bước 5 (tích hợp hệ thống) và Bước 6 (benchmark phần cứng), sau đó xuất báo cáo:
 
-python test_step6.py
-python run_step6.py `
-  --out results/system_evaluation `
-  --data-root VisDrone2019-VID-test-dev `
-  --max-frames 200 --reps 1 `
-  --policies B8 --imgsz 1024 --backend pytorch
-python make_step6_report.py --results results/system_evaluation
+python step5_integrated_system.py
+python step6_hardware_benchmark.py
+python report_system_metrics.py
 
-Khi không truyền --sequences, chương trình tự lấy mọi thư mục sequence trong
---data-root. Vì vậy kết quả chuẩn không thể vô tình chỉ chạy một vài sequence.
-Các policy dùng chung detection cache trong cùng lần chạy để so sánh công bằng.
-Kết quả được lưu trong [results/system_evaluation](results/system_evaluation):
+Các tuỳ chọn chạy nhanh cho Bước 5 (giới hạn số sequence/frame, không sửa code):
 
-- step6_metrics.json: protocol và metric tổng hợp theo policy.
-- step6_policies.csv: một dòng cho mỗi policy.
-- step6_sequences.csv: phân rã theo sequence và repetition.
-- step6_report.md: báo cáo diễn giải.
-- step6_faults.json: kiểm tra fail-safe và output gate.
-- step6_privacy.json: đánh giá Re-ID oracle nếu đã bật.
+   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
+   NCKH_BACKEND=openvino python step5_integrated_system.py
 
-Trong báo cáo, *B8 là cấu hình chính của toàn bộ hệ thống*. B1-B7 chỉ được
-dùng làm baseline/ablation để đo đánh đổi giữa coverage, độ trễ và chi phí
-detector; không trình bày chúng như các kết quả tổng thể độc lập.
+Kết quả được lưu trong [results/](results/):
+
+- step5: results/system_metrics_unified.csv, results/output_gate_log.json, outputs/protected_video.mp4
+- step6: results/hardware_benchmark.csv
+- report: results/system_report.md
 
 Các tham số mặc định của protocol là CPU, imgsz=1024, confidence 0.25,
 IoU 0.5, tối đa 200 frame/sequence, một repetition, warm-up 30 frame và

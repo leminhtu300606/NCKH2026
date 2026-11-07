@@ -52,6 +52,7 @@ OUT_GATE_LOG = Path(os.getenv("NCKH_OUT_GATE_LOG", "results/output_gate_log.json
 OUT_METRICS = Path(os.getenv("NCKH_OUT_METRICS", "results/system_metrics_unified.csv"))
 COORDINATOR_RULES = Path("config/coordinator_rules.json")
 TAU_PATH = Path("config/tau_val.json")
+RISK_DATASET_PATH = Path("zip_extract_full/artifacts/risk_dataset.csv")
 
 FEATURES = [
     "conf", "conf_std5", "conf_delta", "track_age", "hit_ratio",
@@ -67,7 +68,7 @@ IMG_SIZE = 1024
 # "Failed to write frame" trên môi trường không có encoder tương thích.
 # Metrics (PSNR/SSIM) vẫn được tính trên frame đã che trong bộ nhớ.
 WRITE_VIDEO = False
-CONF_THRES = 0.0075
+CONF_THRES = 0.05
 IOU_THRES = 0.7
 TRACK_HIGH_THRESH = 0.10
 TRACK_LOW_THRESH = 0.01
@@ -133,9 +134,32 @@ def load_risk_model() -> Any:
 
 
 def predict_risk(risk_model: Any, X: np.ndarray) -> float:
-    if _HAS_JOBLIB and hasattr(risk_model, "predict_proba"):
-        return float(risk_model.predict_proba(X)[0, 1])
+    """Dự đoán xác suất rủi ro cho một vector đặc trưng."""
     return float(risk_model.predict_proba(X)[0, 1])
+
+
+def load_risk_labels_lookup() -> dict:
+    """Tải nhãn rủi ro ground truth từ risk_dataset.csv để đánh giá model tại runtime.
+
+    Lookup key: (sequence, track_id) -> list of (window_start, window_end, label).
+    Chỉ dùng nhãn khi track_id và frame khớp với cửa sổ trong artifact; nếu không
+    khớp, bỏ qua track đó (không ép nhãn giả tạo).
+    """
+    lookup: dict[tuple[str, int], list[tuple[int, int, int]]] = {}
+    if not RISK_DATASET_PATH.exists():
+        print(
+            f"[Bước 5] Cảnh báo: không tìm thấy {RISK_DATASET_PATH}, "
+            "bỏ qua đánh giá risk model ground truth."
+        )
+        return lookup
+    df = pd.read_csv(RISK_DATASET_PATH)
+    for _, row in df.iterrows():
+        key = (str(row["sequence"]), int(row["track_id"]))
+        lookup.setdefault(key, []).append(
+            (int(row["window_start"]), int(row["window_end"]), int(row["label"]))
+        )
+    print(f"[Bước 5] Đã tải {len(lookup)} khóa nhãn rủi ro từ {RISK_DATASET_PATH}")
+    return lookup
 
 
 NORM_MIN_SAMPLES = 50
@@ -294,6 +318,139 @@ def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, bins: int =
     return ece
 
 
+def average_precision(
+    preds_by_frame: dict[str, dict[int, list[tuple[list[float], float]]]],
+    gts_by_frame: dict[str, dict[int, list[list[float]]]],
+    iou_thresholds: list[float],
+) -> dict[float, float]:
+    """Tính Average Precision (VOC/COCO style) tại các ngưỡng IoU.
+
+    preds_by_frame: seq -> frame -> list of (box, conf)
+    gts_by_frame: seq -> frame -> list of box
+    Trả về dict {iou_threshold: AP}.
+    """
+    # Gom tất cả detection thành danh sách (seq, frame, box, conf)
+    all_dets: list[tuple[str, int, list[float], float]] = []
+    total_gt = 0
+    for seq, seq_gts in gts_by_frame.items():
+        seq_preds = preds_by_frame.get(seq, {})
+        for frame_number, gts in seq_gts.items():
+            total_gt += len(gts)
+            dets = seq_preds.get(frame_number, [])
+            for box, conf in dets:
+                all_dets.append((seq, frame_number, box, conf))
+
+    # Sort theo conf giảm dần
+    all_dets.sort(key=lambda x: x[3], reverse=True)
+
+    aps: dict[float, float] = {}
+    for iou_thr in iou_thresholds:
+        tp = np.zeros(len(all_dets), dtype=np.float64)
+        fp = np.zeros(len(all_dets), dtype=np.float64)
+        # Đánh dấu GT đã match (seq, frame, gt_idx)
+        matched_gt: set[tuple[str, int, int]] = set()
+        for i, (seq, frame_number, box, conf) in enumerate(all_dets):
+            gts = gts_by_frame.get(seq, {}).get(frame_number, [])
+            best_iou = 0.0
+            best_gt_idx = -1
+            for j, gt in enumerate(gts):
+                if (seq, frame_number, j) in matched_gt:
+                    continue
+                iou_val = iou(box, gt)
+                if iou_val > best_iou:
+                    best_iou = iou_val
+                    best_gt_idx = j
+            if best_iou >= iou_thr and best_gt_idx >= 0:
+                tp[i] = 1.0
+                matched_gt.add((seq, frame_number, best_gt_idx))
+            else:
+                fp[i] = 1.0
+
+        cum_tp = np.cumsum(tp)
+        cum_fp = np.cumsum(fp)
+        recalls = cum_tp / max(1, total_gt)
+        precisions = cum_tp / np.maximum(cum_tp + cum_fp, 1e-9)
+        # VOC AP: integral of precision-recall envelope (11-point interpolation)
+        ap = 0.0
+        for t in np.arange(0.0, 1.1, 0.1):
+            p_at_recall = precisions[recalls >= t].max() if np.any(recalls >= t) else 0.0
+            ap += p_at_recall
+        aps[iou_thr] = float(ap / 11.0)
+    return aps
+
+
+def mota_motp(
+    gt_all: dict[str, dict[int, list[list[float]]]],
+    pred_all: dict[str, dict[int, list[list[float]]]],
+) -> dict[str, float]:
+    """Tính MOTA và MOTP dựa trên matching một-một theo frame tại IoU >= 0.5.
+
+    VisDrone VID test-dev không cung cấp track ID ground-truth, nên IDSW
+    không thể tính chính xác. Ở đây IDSW coi là 0 (không theo dõi liên tục).
+    """
+    total_gt = total_tp = total_fp = total_fn = 0
+    iou_sum = 0.0
+    iou_count = 0
+    for seq, seq_gt in gt_all.items():
+        seq_pred = pred_all.get(seq, {})
+        for frame_number, gts in seq_gt.items():
+            preds = seq_pred.get(frame_number, [])
+            total_gt += len(gts)
+            if not gts or not preds:
+                total_fp += len(preds)
+                total_fn += len(gts)
+                continue
+            ious = np.array(
+                [[iou(pred, gt) for gt in gts] for pred in preds],
+                dtype=np.float64,
+            )
+            match_cost = np.where(ious >= 0.5, -1.0 - ious * 1e-6, 0.0)
+            pred_indices, gt_indices = linear_sum_assignment(match_cost)
+            matched_pairs = [(p, g) for p, g in zip(pred_indices, gt_indices)
+                             if ious[p, g] >= 0.5]
+            matched = len(matched_pairs)
+            total_tp += matched
+            total_fp += len(preds) - matched
+            total_fn += len(gts) - matched
+            for p, g in matched_pairs:
+                iou_sum += float(ious[p, g])
+                iou_count += 1
+
+    mota = 1.0 - (total_fn + total_fp) / max(1, total_gt)  # IDSW = 0
+    motp = iou_sum / max(1, iou_count)
+    return {
+        "mota": float(mota),
+        "motp": float(motp),
+        "total_gt": int(total_gt),
+        "total_tp": int(total_tp),
+        "total_fp": int(total_fp),
+        "total_fn": int(total_fn),
+    }
+
+
+def compute_lpips(img1: np.ndarray, img2: np.ndarray) -> float | None:
+    """Tính LPIPS giữa hai ảnh (yêu cầu torchvision). Trả về None nếu không có."""
+    try:
+        import torch
+        import torchvision
+        from torchvision.models import LPIPS  # type: ignore
+    except Exception:
+        return None
+    try:
+        # Chuẩn hóa về [-1, 1], resize về 224x224
+        t1 = torch.from_numpy(img1).float().permute(2, 0, 1).unsqueeze(0) / 255.0 * 2.0 - 1.0
+        t2 = torch.from_numpy(img2).float().permute(2, 0, 1).unsqueeze(0) / 255.0 * 2.0 - 1.0
+        t1 = torch.nn.functional.interpolate(t1, size=(224, 224), mode="bilinear", align_corners=False)
+        t2 = torch.nn.functional.interpolate(t2, size=(224, 224), mode="bilinear", align_corners=False)
+        model = LPIPS(net="alex", verbose=False)
+        model.eval()
+        with torch.no_grad():
+            val = model(t1, t2)
+        return float(val.item())
+    except Exception:
+        return None
+
+
 def compute_metrics(
     gt_all: dict[str, dict[int, list[list[float]]]],
     pred_all: dict[str, dict[int, list[list[float]]]],
@@ -311,11 +468,13 @@ def compute_metrics(
     psnr_count: int,
     ssim_sum: float,
     ssim_count: int,
+    lpisms_sum: float,
+    lpisms_count: int,
     risk_y_true: list[int] | None = None,
     risk_y_prob: list[float] | None = None,
 ) -> dict[str, Any]:
     def box_metrics(
-        predictions: dict[str, dict[int, list[list[float]]]],
+        predictions: dict[str, dict[int, list[list[float]] | list[tuple[list[float], float]]]],
         only_predicted_frames: bool = False,
     ) -> tuple[float, float, float, int, int]:
         total_gt = total_tp = total_fp = 0
@@ -326,7 +485,14 @@ def compute_metrics(
                 # scheduler giãn lịch sẽ làm recall detector thấp giả tạo.
                 if only_predicted_frames and frame_number not in seq_pred:
                     continue
-                preds = seq_pred.get(frame_number, [])
+                raw_preds = seq_pred.get(frame_number, [])
+                # Chuẩn hóa về list of box (loại bỏ conf nếu có)
+                preds = []
+                for p in raw_preds:
+                    if isinstance(p, tuple):
+                        preds.append(p[0])
+                    else:
+                        preds.append(p)
                 total_gt += len(gts)
                 if not gts or not preds:
                     total_fp += len(preds)
@@ -360,6 +526,24 @@ def compute_metrics(
 
     avg_psnr = psnr_sum / max(1, psnr_count) if psnr_count > 0 else 0.0
     avg_ssim = ssim_sum / max(1, ssim_count) if ssim_count > 0 else 0.0
+    avg_lpips = lpisms_sum / max(1, lpisms_count) if lpisms_count > 0 else None
+
+    # AP@0.5 và AP@0.5:0.95 (COCO/VOC style) cho detector
+    detection_aps = average_precision(
+        detector_all, gt_all, iou_thresholds=[0.5, 0.5, 0.75]
+    )
+    # average_precision trả về AP cho mỗi iou threshold; chúng ta lấy AP@0.5
+    # và trung bình các ngưỡng 0.5:0.05:0.95 (COCO-style).
+    ap50 = detection_aps.get(0.5, 0.0)
+    # AP@0.5:0.95: tính trung bình AP tại các ngưỡng 0.5, 0.55, ..., 0.95
+    ap_thresholds = [round(0.5 + 0.05 * i, 2) for i in range(10)]
+    detection_aps_all = average_precision(
+        detector_all, gt_all, iou_thresholds=ap_thresholds
+    )
+    ap50_95 = float(np.mean([detection_aps_all.get(t, 0.0) for t in ap_thresholds]))
+
+    # MOTA, MOTP cho tracking (per-frame matching, IDSW = 0 do không có GT track ID)
+    tracking_mot = mota_motp(gt_all, pred_all)
 
     total_frames = sum(frames_all.values())
     output_gate_block_rate = blocked_frames / max(1, total_frames)
@@ -417,6 +601,11 @@ def compute_metrics(
         "tracking_f1": tracking_f1,
         "avg_psnr_db": avg_psnr,
         "avg_ssim": avg_ssim,
+        "avg_lpips": avg_lpips if avg_lpips is not None else 0.0,
+        "detection_ap50": ap50,
+        "detection_ap50_95": ap50_95,
+        "tracking_mota": tracking_mot["mota"],
+        "tracking_motp": tracking_mot["motp"],
         "output_gate_block_rate": output_gate_block_rate,
         "output_gate_release_rate": output_gate_release_rate,
         "protect_box_coverage_iou50": protect_box_coverage,
@@ -636,6 +825,7 @@ def run_sequence(
     max_frames: int,
     device: str = "cpu",
     half: bool = False,
+    risk_labels_lookup: dict | None = None,
 ) -> dict[str, Any]:
     seq_dir = SEQUENCES_DIR / seq_name
     images = sorted(seq_dir.glob("*.jpg"))[:max_frames]
@@ -661,6 +851,8 @@ def run_sequence(
     psnr_count = 0
     ssim_sum = 0.0
     ssim_count = 0
+    lpisms_sum = 0.0
+    lpisms_count = 0
 
     frame_idx = 0
     last_detect_frame = -10000
@@ -825,7 +1017,19 @@ def run_sequence(
             X = np.array([feat[f] for f in FEATURES], dtype=np.float32)
             X_norm = risk_standardizer.transform(X).reshape(1, -1)
             risk_prob = predict_risk(risk_model, X_norm)
-            risk_y_prob.append(risk_prob)
+            # Chỉ ghi nhận cặp (y_true, y_prob) khi có ground truth label khớp
+            # theo (sequence, track_id, cửa sổ frame) từ risk_dataset.csv.
+            matched_label: int | None = None
+            if risk_labels_lookup:
+                track_key = (seq_name, tid)
+                if track_key in risk_labels_lookup:
+                    for ws, we, lbl in risk_labels_lookup[track_key]:
+                        if ws <= frame_idx <= we:
+                            matched_label = lbl
+                            break
+            if matched_label is not None:
+                risk_y_true.append(matched_label)
+                risk_y_prob.append(risk_prob)
             if risk_prob > frame_risk:
                 frame_risk = risk_prob
 
@@ -875,7 +1079,10 @@ def run_sequence(
             writer.write(out_frame)
 
         if should_detect:
-            detector_boxes_by_frame[frame_number] = detections_np[:, :4].tolist()
+            detector_boxes_by_frame[frame_number] = [
+                ([float(b[0]), float(b[1]), float(b[2]), float(b[3])], float(b[4]))
+                for b in detections_np[:, :5].tolist()
+            ]
         pred_boxes_by_frame[frame_number] = track_boxes
         gt_boxes_by_frame[frame_number] = gt.get(frame_number, [])
 
@@ -892,6 +1099,15 @@ def run_sequence(
                 ssim_val = compute_ssim(frame, out_frame)
                 ssim_sum += ssim_val
                 ssim_count += 1
+            except Exception:
+                pass
+
+        if frame_idx % SSIM_INTERVAL == 0:
+            try:
+                lpips_val = compute_lpips(frame, out_frame)
+                if lpips_val is not None:
+                    lpips_sum += lpips_val
+                    lpips_count += 1
             except Exception:
                 pass
 
@@ -919,6 +1135,8 @@ def run_sequence(
         "psnr_count": psnr_count,
         "ssim_sum": ssim_sum,
         "ssim_count": ssim_count,
+        "lpisms_sum": lpisms_sum,
+        "lpisms_count": lpisms_count,
     }
 
 
@@ -939,6 +1157,7 @@ def main() -> None:
     print(f"[Bước 5] Detector backend: pytorch | device: {DEVICE} | half: False")
     risk_model = load_risk_model()
     tau = load_tau()
+    risk_labels_lookup = load_risk_labels_lookup()
 
     coordinator_rules = {}
     if COORDINATOR_RULES.exists():
@@ -986,6 +1205,8 @@ def main() -> None:
     total_psnr_count = 0
     total_ssim_sum = 0.0
     total_ssim_count = 0
+    total_lpisms_sum = 0.0
+    total_lpisms_count = 0
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = None
@@ -1010,6 +1231,7 @@ def main() -> None:
         result = run_sequence(
             seq, model, risk_model, tau, coordinator_rules, writer,
             MAX_FRAMES_PER_SEQ, det_device, detector_half,
+            risk_labels_lookup,
         )
 
         all_gt[seq] = result["gt_boxes_by_frame"]
@@ -1032,6 +1254,8 @@ def main() -> None:
         total_psnr_count += result["psnr_count"]
         total_ssim_sum += result["ssim_sum"]
         total_ssim_count += result["ssim_count"]
+        total_lpisms_sum += result["lpisms_sum"]
+        total_lpisms_count += result["lpisms_count"]
 
     if writer is not None:
         writer.release()
@@ -1043,6 +1267,7 @@ def main() -> None:
         total_protected_gt_boxes, total_contained_gt_boxes, total_protect_gt_boxes,
         total_psnr_sum, total_psnr_count,
         total_ssim_sum, total_ssim_count,
+        total_lpisms_sum, total_lpisms_count,
         all_risk_y_true, all_risk_y_prob,
     )
 

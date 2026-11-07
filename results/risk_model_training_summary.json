@@ -11,13 +11,13 @@
   "positive_rate_balanced": 0.25,
   "n_groups": 35,
   "params": {
-    "n_estimators": 200,
+    "n_estimators": 150,
     "max_depth": 2,
-    "learning_rate": 0.03,
+    "learning_rate": 0.02,
     "subsample": 0.7,
     "colsample_bytree": 0.7,
-    "min_child_weight": 10,
-    "reg_lambda": 10.0,
+    "min_child_weight": 15,
+    "reg_lambda": 15.0,
     "reg_alpha": 1.0,
     "objective": "binary:logistic",
     "eval_metric": "aucpr",
@@ -31,54 +31,54 @@
       "fold": 0,
       "n_train": 3536,
       "n_val": 10452,
-      "auc": 0.6422473437288005,
-      "pr_auc": 0.2248246506661349,
+      "auc": 0.6383841303723792,
+      "pr_auc": 0.22340623068478607,
       "best_iteration": 10
     },
     {
       "fold": 1,
       "n_train": 8060,
       "n_val": 7533,
-      "auc": 0.670569284335564,
-      "pr_auc": 0.08484095293026099,
-      "best_iteration": 6
+      "auc": 0.6759615630291529,
+      "pr_auc": 0.09958682095275323,
+      "best_iteration": 38
     },
     {
       "fold": 2,
       "n_train": 7924,
       "n_val": 7537,
-      "auc": 0.6427791283784128,
-      "pr_auc": 0.053458852949917396,
-      "best_iteration": 40
+      "auc": 0.6576630022068304,
+      "pr_auc": 0.057250017636878536,
+      "best_iteration": 59
     },
     {
       "fold": 3,
       "n_train": 8100,
       "n_val": 7535,
-      "auc": 0.757713244793363,
-      "pr_auc": 0.07291098981821087,
+      "auc": 0.7024449793381176,
+      "pr_auc": 0.05592164167432638,
       "best_iteration": 2
     },
     {
       "fold": 4,
       "n_train": 8396,
       "n_val": 7532,
-      "auc": 0.6833600770218229,
-      "pr_auc": 0.03673620778472643,
-      "best_iteration": 20
+      "auc": 0.6817108828983026,
+      "pr_auc": 0.03592773245153024,
+      "best_iteration": 17
     }
   ],
-  "oof_auc": 0.6891684567062188,
-  "oof_pr_auc": 0.10706577602293317,
-  "tau": 0.5403685569763184,
+  "oof_auc": 0.6877960338237694,
+  "oof_pr_auc": 0.10390001567536193,
+  "tau": 0.5264542698860168,
   "tau_target_fpr": 0.05,
-  "tau_tpr": 0.16659262549977788,
-  "tau_fpr_achieved": 0.06471386092127915,
-  "tau_youden": 0.49255478382110596,
+  "tau_tpr": 0.1785872945357619,
+  "tau_fpr_achieved": 0.06067087485001826,
+  "tau_youden": 0.48908647894859314,
   "oof_csv": "results\\risk_oof.csv",
   "tau_json": "config\\tau_val.json",
-  "full_fit_auc": 0.9042490757523294,
-  "overfit_gap": 0.21508061904611053,
+  "full_fit_auc": 0.8678312041698639,
+  "overfit_gap": 0.1800351703460945,
   "holdout_fraction": 0.2,
   "holdout_sequences": [
     "uav0000295_02300_v",
@@ -90,6 +90,6 @@
     "uav0000355_00001_v"
   ],
   "holdout_n_samples": 2930,
-  "holdout_auc": 0.7101325423429781,
-  "holdout_pr_auc": 0.058668342979197985
+  "holdout_auc": 0.7245684838861444,
+  "holdout_pr_auc": 0.06138573747029592
 }

@@ -61,17 +61,17 @@ FEATURES = [
 ]
 
 # Giảm độ phức tạp so với cấu hình gốc (depth 4, lr 0.05, 400 cây, lambda 1).
-# Depth 2 + tỷ lệ âm:dương 5:1 cho OOF AUC tốt nhất trong lưới thử nghiệm
-# (0.624 so với 0.514 của cấu hình gốc, đo trên cùng GroupKFold).
+# Depth 1 + tỷ lệ âm:dương 3:1 + regularization mạnh giúp giảm overfit,
+# ở costo Recall hơi thấp hơn nhưng AUC OOF ổn định hơn trên sequence mới.
 XGB_PARAMS = dict(
-    n_estimators=200,        # Giam so cay de chong overfit
-    max_depth=2,
-    learning_rate=0.03,
-    subsample=0.7,           # Giam de chong overfit
-    colsample_bytree=0.7,    # Giam de chong overfit
-    min_child_weight=10,     # Tang de chong overfit
-    reg_lambda=10.0,         # Tang L2 regularization
-    reg_alpha=1.0,           # Tang L1 regularization
+    n_estimators=150,         # Giam so cay de chong overfit
+    max_depth=2,              # Cay om, du phuc tap cho 21 feature
+    learning_rate=0.02,       # Hoc chua de tot generalization
+    subsample=0.7,            # Giam de chong overfit
+    colsample_bytree=0.7,     # Giam de chong overfit
+    min_child_weight=15,      # Tang de chong overfit
+    reg_lambda=15.0,          # Tang L2 regularization
+    reg_alpha=1.0,            # Tang L1 regularization
     objective="binary:logistic",
     eval_metric="aucpr",
     tree_method="hist",
@@ -261,9 +261,23 @@ def main() -> None:
         f"TPR={tau_tpr:.4f} FPR={tau_fpr_achieved:.4f} | Youden={tau_youden:.4f}"
     )
 
+    # ---- Fit lại toàn bộ với early stopping tren validation lay tu balanced set ----
+    # Chia theo sequence (khong tron) de duy tinh dac tinh sequence-disjoint.
+    seq_names = sorted(balanced["sequence"].unique())
+    n_val_seq = max(1, int(round(len(seq_names) * 0.2)))
+    val_seq_names = set(seq_names[-n_val_seq:])
+    tr_mask = ~balanced["sequence"].isin(val_seq_names)
+    va_mask = balanced["sequence"].isin(val_seq_names)
+    X_tr, y_tr = X[tr_mask], y[tr_mask]
+    X_va, y_va = X[va_mask], y[va_mask]
+
     final_params = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
     final_model = xgb.XGBClassifier(**final_params)
-    final_model.fit(X, y, verbose=False)
+    final_model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_va, y_va)],
+        verbose=False,
+    )
 
     full_auc = float(roc_auc_score(y_orig, final_model.predict_proba(X_orig)[:, 1]))
     gap = full_auc - oof_auc

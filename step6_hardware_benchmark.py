@@ -29,7 +29,7 @@ RISK_MODEL_PATH = Path("models/xgboost_risk.json")
 OUT_CSV = Path("results/hardware_benchmark.csv")
 
 IMG_SIZE = 1024
-CONF_THRES = 0.0075
+CONF_THRES = 0.05
 IOU_THRES = 0.7
 WARMUP = 10
 MEASURE = 100
