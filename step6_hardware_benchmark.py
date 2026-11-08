@@ -30,8 +30,8 @@ import torch
 import xgboost as xgb
 from ultralytics import YOLO
 
-WEIGHTS_PATH = Path("models/best.pt")
-RISK_MODEL_PATH = Path("models/xgboost_risk.json")
+WEIGHTS_PATH = Path("zip_extract_full/artifacts/yolo26s.pt")
+RISK_MODEL_PATH = Path("zip_extract_full/artifacts/risk_model.json")
 OUT_CSV = Path("results/hardware_benchmark.csv")
 
 IMG_SIZE = 1024

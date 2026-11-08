@@ -47,9 +47,9 @@ try:
 except Exception:
     _HAS_JOBLIB = False
 
-WEIGHTS_PATH = Path("models/best.pt")
-RISK_MODEL_PATH = Path("models/xgboost_risk.json")
-RISK_CALIBRATED_PATH = Path("models/xgboost_risk_calibrated.joblib")
+WEIGHTS_PATH = Path("zip_extract_full/artifacts/yolo26s.pt")
+RISK_MODEL_PATH = Path("zip_extract_full/artifacts/risk_model.json")
+RISK_CALIBRATED_PATH = Path("zip_extract_full/artifacts/risk_model_calibrated.joblib")
 DATA_ROOT = Path("VisDrone2019-VID-test-dev")
 SEQUENCES_DIR = DATA_ROOT / "sequences"
 ANNOTATIONS_DIR = DATA_ROOT / "annotations"
