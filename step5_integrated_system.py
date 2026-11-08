@@ -85,7 +85,7 @@ PROTECT_PADDING = 0.15
 # Cho phép chạy nhanh để so sánh backend mà không sửa code:
 #   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
 DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "pytorch")
-ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "models/best_raw_dyn.onnx"))
+ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "zip_extract_full/artifacts/yolo26s.onnx"))
 MAX_SEQS = int(os.getenv("NCKH_MAX_SEQS", "0"))  # 0 = tất cả sequence
 MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "200"))
 WARMUP_FRAMES = 30
@@ -156,8 +156,9 @@ def run_onnx_detect(
 ) -> np.ndarray:
     """Chạy inference ONNX detector và trả về detections_np (x1,y1,x2,y2,conf,cls).
 
-    Mô hình ONNX là raw head (1, 5, anchors) -> cần NMS ngoài graph.
-    Ultralytics dùng letterbox rect nên input thật là 736x1280 (không phải vuông).
+    Mô hình ONNX đã xuất từ Ultralytics với output (1, 300, 6) =
+    [cx, cy, w, h, conf, class] trong không gian ảnh gốc (đã un-scale trong graph).
+    Chuyển về [x1, y1, x2, y2] trước khi trả về.
     """
     h, w = frame.shape[:2]
     scale = min(img_size / h, img_size / w)
@@ -173,28 +174,30 @@ def run_onnx_detect(
     blob = np.expand_dims(blob, axis=0)
 
     outputs = ort_session.run(None, {input_name: blob})
-    raw = outputs[0][0]  # (5, num_anchors)
-    confs = raw[4]
-    boxes = raw[:4].T
+    # Output shape: (1, 300, 6) -> [cx, cy, w, h, conf, class] trong không gian ảnh gốc
+    preds = outputs[0][0]  # (300, 6)
 
-    mask = confs >= conf_thres
+    # Lọc theo conf
+    mask = preds[:, 4] >= conf_thres
     if not mask.any():
         return np.empty((0, 6), dtype=np.float32)
 
-    confs = confs[mask]
-    boxes = boxes[mask]
+    dets = preds[mask]
+    cx = dets[:, 0]
+    cy = dets[:, 1]
+    bw = dets[:, 2]
+    bh = dets[:, 3]
+    x1 = np.clip(cx - bw / 2.0, 0, w)
+    y1 = np.clip(cy - bh / 2.0, 0, h)
+    x2 = np.clip(cx + bw / 2.0, 0, w)
+    y2 = np.clip(cy + bh / 2.0, 0, h)
+    confs = dets[:, 4]
+    classes = dets[:, 5]
 
-    cx = boxes[:, 0]
-    cy = boxes[:, 1]
-    bw = boxes[:, 2]
-    bh = boxes[:, 3]
-    x1 = np.clip((cx - bw / 2 - left) / scale, 0, w)
-    y1 = np.clip((cy - bh / 2 - top) / scale, 0, h)
-    x2 = np.clip((cx + bw / 2 - left) / scale, 0, w)
-    y2 = np.clip((cy + bh / 2 - top) / scale, 0, h)
-
+    # NMS bổ sung (nếu muốn chặt hơn) - iou_thres dùng để lọc box trùng lặp
     order = np.argsort(-confs)
     keep = []
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
     while order.size > 0:
         i = order[0]
         keep.append(i)
@@ -202,14 +205,24 @@ def run_onnx_detect(
             break
         rest = order[1:]
         ovr_list = [
-            iou([x1[i], y1[i], x2[i], y2[i]], [x1[j], y1[j], x2[j], y2[j]])
+            iou(
+                [boxes_xyxy[i, 0], boxes_xyxy[i, 1], boxes_xyxy[i, 2], boxes_xyxy[i, 3]],
+                [boxes_xyxy[j, 0], boxes_xyxy[j, 1], boxes_xyxy[j, 2], boxes_xyxy[j, 3]],
+            )
             for j in rest
         ]
         ovr = np.array(ovr_list)
         order = rest[ovr < iou_thres]
 
     det_out = np.stack(
-        [x1[keep], y1[keep], x2[keep], y2[keep], confs[keep], np.zeros(len(keep))],
+        [
+            x1[keep],
+            y1[keep],
+            x2[keep],
+            y2[keep],
+            confs[keep],
+            classes[keep],
+        ],
         axis=1,
     )
     return det_out.astype(np.float32)
@@ -985,11 +998,24 @@ def run_sequence(
                 # Tạo đối tượng results giả tương thích với ultralytics Boxes cho tracker.update
                 class _OnnxBoxes:
                     def __init__(self, det: np.ndarray):
-                        self.conf = det[:, 4] if len(det) else np.empty((0,), dtype=np.float32)
-                        self.cls = det[:, 5] if len(det) else np.empty((0,), dtype=np.float32)
-                        self.xyxy = det[:, :4] if len(det) else np.empty((0, 4), dtype=np.float32)
-                        self.xywh = np.empty((0, 4), dtype=np.float32)
-                        self.xywhr = np.empty((0, 5), dtype=np.float32)
+                        if len(det) > 0:
+                            self.conf = det[:, 4].astype(np.float32)
+                            self.cls = det[:, 5].astype(np.float32)
+                            self.xyxy = det[:, :4].astype(np.float32)
+                            # Tính xywh từ xyxy (center_x, center_y, w, h)
+                            x1, y1, x2, y2 = self.xyxy[:, 0], self.xyxy[:, 1], self.xyxy[:, 2], self.xyxy[:, 3]
+                            cx = (x1 + x2) / 2.0
+                            cy = (y1 + y2) / 2.0
+                            w = x2 - x1
+                            h = y2 - y1
+                            self.xywh = np.stack([cx, cy, w, h], axis=1).astype(np.float32)
+                            self.xywhr = np.stack([cx, cy, w, h, np.zeros_like(cx)], axis=1).astype(np.float32)
+                        else:
+                            self.conf = np.empty((0,), dtype=np.float32)
+                            self.cls = np.empty((0,), dtype=np.float32)
+                            self.xyxy = np.empty((0, 4), dtype=np.float32)
+                            self.xywh = np.empty((0, 4), dtype=np.float32)
+                            self.xywhr = np.empty((0, 5), dtype=np.float32)
 
                     def cpu(self):
                         return self
@@ -997,6 +1023,26 @@ def run_sequence(
                     @property
                     def boxes(self):
                         return self
+
+                    def __getitem__(self, inds):
+                        if isinstance(inds, np.ndarray):
+                            if inds.dtype == bool:
+                                inds = np.flatnonzero(inds)
+                            else:
+                                inds = inds.tolist()
+                        if len(inds) > 0:
+                            det = np.column_stack(
+                                [
+                                    self.xyxy[inds],
+                                    self.conf[inds],
+                                    self.cls[inds],
+                                ]
+                            )
+                            return _OnnxBoxes(det)
+                        return _OnnxBoxes(np.empty((0, 6), dtype=np.float32))
+
+                    def __len__(self):
+                        return len(self.conf)
 
                 results_boxes = _OnnxBoxes(detections_np)
                 results = type(
@@ -1043,7 +1089,8 @@ def run_sequence(
 
         if len(tracker_out) > 0:
             for row in tracker_out:
-                x1, y1, x2, y2, tid, score, cls, det_idx = row
+                x1, y1, x2, y2, tid, score, cls = row[:7]
+                det_idx = int(row[7]) if len(row) > 7 else -1
                 track_boxes.append([float(x1), float(y1), float(x2), float(y2)])
                 track_confs.append(float(score))
                 track_ids.append(int(tid))
