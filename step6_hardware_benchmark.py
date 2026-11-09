@@ -1,13 +1,13 @@
 """Bước 6: Đo hiệu năng phần cứng khi nạp mô hình vào thiết bị.
 
 Input:
-- models/best.pt (mô hình detect)
-- models/xgboost_risk.json (mô hình XGBoost)
+- final_extracted/best.pt (mô hình detect)
+- final_extracted/xgboost_risk.json (mô hình XGBoost)
 
 Output:
 - results/hardware_benchmark.csv (latency, FPS, RAM, CPU/GPU)
 
-Latency end-to-end bây giờ bao gồm: detect YOLO -> tính 21 đặc trưng rủi ro
+Latency end-to-end bây giờ bao gồm: detect YOLO -> tính 25 đặc trưng rủi ro
 -> XGBoost predict_proba -> GaussianBlur, phản ánh chi phí thực tế trên một
 frame thay vì chỉ đo detector đơn lẻ. Báo cáo thêm tỉ lệ frame vượt deadline
 thiết bị biên (mặc định 40 ms theo README).
@@ -30,8 +30,8 @@ import torch
 import xgboost as xgb
 from ultralytics import YOLO
 
-WEIGHTS_PATH = Path("zip_extract_full/artifacts/yolo26s.pt")
-RISK_MODEL_PATH = Path("zip_extract_full/artifacts/risk_model.json")
+WEIGHTS_PATH = Path("final_extracted/artifacts/yolo26s.pt")
+RISK_MODEL_PATH = Path("final_extracted/artifacts/risk_model.json")
 OUT_CSV = Path("results/hardware_benchmark.csv")
 
 IMG_SIZE = 1024
@@ -45,7 +45,19 @@ EDGE_DEADLINE_MS = float(os.getenv("NCKH_EDGE_DEADLINE_MS", "40.0"))
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 print(f"[Bước 6] Sử dụng thiết bị: {DEVICE} (CUDA: {torch.cuda.is_available()})")
 
+# ===== HỢP ĐỒNG ĐẶC TRƯNG (schema v2) =====
+# 25 đặc trưng khớp với notebook train + step5 runtime.
 FEATURES = [
+    "conf", "conf_std5", "conf_delta", "conf_mean5", "conf_slope5",
+    "lap_var_log", "brightness", "motion_blur_ratio", "crop_contrast",
+    "track_age", "hit_ratio", "time_since_update",
+    "speed_norm", "pred_uncert", "iou_prev", "scale_change",
+    "min_side_px", "area_norm", "height_norm", "center_y_norm", "dist_edge",
+    "nearest_dist_norm", "n_neighbors_r2_norm", "overlap_max",
+    "n_det_expected_ratio",
+]
+# Model 21-feature cũ vẫn benchmark được (đặc trưng chẩn đoán vẫn được tính).
+LEGACY_FEATURES = [
     "conf", "conf_std5", "conf_delta", "track_age", "hit_ratio",
     "time_since_update", "track_state", "min_side_px", "aspect_dev",
     "dist_edge", "is_trunc", "speed_norm", "pred_uncert", "lap_var_log",
@@ -54,11 +66,21 @@ FEATURES = [
     "n_det_expected_ratio",
 ]
 
+
+def resolve_feature_names(model: xgb.XGBClassifier) -> list[str]:
+    """Chọn danh sách đặc trưng theo số chiều model (25 mới / 21 cũ)."""
+    n_in = getattr(model, "n_features_in_", None)
+    if n_in == len(LEGACY_FEATURES):
+        return list(LEGACY_FEATURES)
+    return list(FEATURES)
+
+
 TRUNC_MARGIN_PX = 2
 CONF_WINDOW = 5
 PRED_UNCERT_WINDOW = 5
 NEIGHBOR_RADIUS_FRAC = 0.05
 NEIGHBOR_K = 5
+CROP_RESIZE = 224
 
 
 def iou(box1: list[float], box2: list[float]) -> float:
@@ -86,7 +108,7 @@ def lap_var_of_crop(frame: np.ndarray, box: list[float], w: int, h: int) -> floa
     return float(cv2.Laplacian(gray_crop, cv2.CV_64F).var())
 
 
-def compute_21_features_light(
+def compute_risk_features(
     box: list[float],
     prev_box: list[float],
     frame: np.ndarray,
@@ -103,7 +125,7 @@ def compute_21_features_light(
     time_since_update: float = 0.0,
     track_state: float = 1.0,
 ) -> dict[str, float]:
-    """Tính 21 đặc trưng rủi ro cho một track đơn (phiên bản đơn giản để benchmark)."""
+    """Tính 25 đặc trưng rủi ro cho một track đơn (bản rút gọn để benchmark)."""
     h, w = frame.shape[:2]
     D = math.hypot(w, h)
     bw = max(box[2] - box[0], 1e-6)
@@ -115,12 +137,24 @@ def compute_21_features_light(
     c5 = conf_history[-(CONF_WINDOW - 1):] + [conf] if CONF_WINDOW > 1 else [conf]
     f_conf_std5 = float(np.std(c5)) if len(c5) > 1 else 0.0
     f_conf_delta = 0.0 if len(conf_history) < 2 else conf - conf_history[-2]
+    f_conf_mean5 = float(np.mean(c5)) if c5 else float(conf)
+    f_conf_slope5 = 0.0
+    if len(c5) >= 2:
+        x = np.arange(len(c5), dtype=np.float64)
+        xm = float(x.mean())
+        denom = float(((x - xm) ** 2).sum())
+        if denom > 0:
+            y = np.asarray(c5, dtype=np.float64)
+            f_conf_slope5 = float(((x - xm) * (y - y.mean())).sum() / denom)
     f_track_age = float(track_age)
     f_hit_ratio = float(hit_ratio)
     f_time_since_update = float(time_since_update)
     f_track_state = float(track_state)
     f_min_side_px = float(min(bw, bh))
     f_aspect_dev = float(abs(bw / bh - r_ref))
+    f_area_norm = float((bw * bh) / max(w * h, 1.0))
+    f_height_norm = float(bh / max(h, 1.0))
+    f_center_y_norm = float(cy / max(h, 1.0))
     f_dist_edge = float(
         max(0.0, min(box[0], box[1], w - box[2], h - box[3]) / D)
     )
@@ -135,8 +169,23 @@ def compute_21_features_light(
     if len(cen_win) > 1:
         arr = np.array(cen_win)
         f_pred_uncert = float(np.sqrt(arr[:, 0].var() + arr[:, 1].var()) / D)
+    f_iou_prev = float(iou(box, prev_box)) if prev_box is not None else 0.0
+    f_scale_change = 0.0
+    if prev_box is not None:
+        prev_area = max(prev_box[2] - prev_box[0], 1e-6) * max(prev_box[3] - prev_box[1], 1e-6)
+        f_scale_change = float(np.clip(math.log(max(bw * bh, 1e-6) / prev_area), -5.0, 5.0))
     f_lap_var_log = float(math.log1p(lap_history[-1])) if lap_history else 0.0
-    f_brightness = 0.5
+
+    # Thống kê crop giống lúc train: cắt theo box track rồi resize về CROP_RESIZE.
+    x1 = max(0, min(int(box[0]), w - 1)); y1 = max(0, min(int(box[1]), h - 1))
+    x2 = max(x1 + 1, min(int(box[2]), w)); y2 = max(y1 + 1, min(int(box[3]), h))
+    crop = gray[y1:y2, x1:x2]
+    if crop.size and max(crop.shape[:2]) > CROP_RESIZE:
+        s = CROP_RESIZE / max(crop.shape[:2])
+        crop = cv2.resize(crop, (max(1, int(crop.shape[1] * s)), max(1, int(crop.shape[0] * s))),
+                          interpolation=cv2.INTER_AREA)
+    f_brightness = float(crop.mean() / 255.0) if crop.size else 0.5
+    f_crop_contrast = float(crop.std() / 255.0) if crop.size else 0.0
     if len(lap_history) >= 2:
         L_prev = lap_history[-2]
         L_cur = lap_history[-1]
@@ -155,24 +204,33 @@ def compute_21_features_light(
         "conf": f_conf,
         "conf_std5": f_conf_std5,
         "conf_delta": f_conf_delta,
-        "track_age": f_track_age,
-        "hit_ratio": f_hit_ratio,
-        "time_since_update": f_time_since_update,
-        "track_state": f_track_state,
-        "min_side_px": f_min_side_px,
-        "aspect_dev": f_aspect_dev,
-        "dist_edge": f_dist_edge,
-        "is_trunc": f_is_trunc,
-        "speed_norm": f_speed_norm,
-        "pred_uncert": f_pred_uncert,
+        "conf_mean5": f_conf_mean5,
+        "conf_slope5": f_conf_slope5,
         "lap_var_log": f_lap_var_log,
         "brightness": f_brightness,
         "motion_blur_ratio": f_motion_blur_ratio,
+        "crop_contrast": f_crop_contrast,
+        "track_age": f_track_age,
+        "hit_ratio": f_hit_ratio,
+        "time_since_update": f_time_since_update,
+        "speed_norm": f_speed_norm,
+        "pred_uncert": f_pred_uncert,
+        "iou_prev": f_iou_prev,
+        "scale_change": f_scale_change,
+        "min_side_px": f_min_side_px,
+        "area_norm": f_area_norm,
+        "height_norm": f_height_norm,
+        "center_y_norm": f_center_y_norm,
+        "dist_edge": f_dist_edge,
         "nearest_dist_norm": f_nearest_dist_norm,
         "n_neighbors_r2_norm": f_n_neighbors_r2_norm,
         "overlap_max": f_overlap_max,
-        "frame_det_delta": f_frame_det_delta,
         "n_det_expected_ratio": f_n_det_expected_ratio,
+        # chẩn đoán (model 21-feature cũ)
+        "track_state": f_track_state,
+        "aspect_dev": f_aspect_dev,
+        "is_trunc": f_is_trunc,
+        "frame_det_delta": f_frame_det_delta,
     }
 
 
@@ -200,6 +258,8 @@ def main() -> None:
     print(f"[Bước 6] Detector backend: pytorch | device: {DEVICE} | half: {det_half}")
     risk_model = xgb.XGBClassifier()
     risk_model.load_model(str(RISK_MODEL_PATH))
+    feature_names = resolve_feature_names(risk_model)
+    print(f"[Bước 6] Risk model dùng {len(feature_names)} đặc trưng (schema v2).")
 
     process = psutil.Process()
     real_frame = Path("VisDrone2019-VID-test-dev/sequences/uav0000009_03358_v/0000001.jpg")
@@ -229,7 +289,7 @@ def main() -> None:
 
     def run_features(dets):
         box = pick_primary_box(dets, w, h) if len(dets) else primary_box
-        return compute_21_features_light(
+        return compute_risk_features(
             box=box,
             prev_box=prev_box,
             frame=frame,
@@ -243,7 +303,7 @@ def main() -> None:
         )
 
     def run_xgb(feat):
-        X = np.array([feat[f] for f in FEATURES], dtype=np.float32).reshape(1, -1)
+        X = np.array([feat[f] for f in feature_names], dtype=np.float32).reshape(1, -1)
         return risk_model.predict_proba(X)
 
     def run_blur():
@@ -291,7 +351,7 @@ def main() -> None:
         cpu_boxes = res[0].cpu().boxes
         dets = cpu_boxes.xyxy.numpy() if len(cpu_boxes.xyxy) else np.empty((0, 4))
         feat = run_features(dets)
-        X = np.array([feat[f] for f in FEATURES], dtype=np.float32).reshape(1, -1)
+        X = np.array([feat[f] for f in feature_names], dtype=np.float32).reshape(1, -1)
         lat = []
         for _ in range(MEASURE):
             t0 = time.perf_counter()

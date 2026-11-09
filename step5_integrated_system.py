@@ -35,6 +35,15 @@ from ultralytics.trackers.byte_tracker import BYTETracker
 
 from ultralytics import YOLO
 
+from metrics_unified import (
+    iou,
+    containment,
+    average_precision_coco,
+    precision_recall_f1_one_to_one,
+    mota_motp,
+    expected_calibration_error,
+)
+
 try:
     import onnxruntime as ort
     _HAS_ORT = True
@@ -47,9 +56,9 @@ try:
 except Exception:
     _HAS_JOBLIB = False
 
-WEIGHTS_PATH = Path("zip_extract_full/artifacts/yolo26s.pt")
-RISK_MODEL_PATH = Path("zip_extract_full/artifacts/risk_model.json")
-RISK_CALIBRATED_PATH = Path("zip_extract_full/artifacts/risk_model_calibrated.joblib")
+WEIGHTS_PATH = Path("final_extracted/artifacts/yolo26s.pt")
+RISK_MODEL_PATH = Path("final_extracted/artifacts/risk_model.json")
+RISK_CALIBRATED_PATH = Path("final_extracted/artifacts/risk_model_calibrated.joblib")
 DATA_ROOT = Path("VisDrone2019-VID-test-dev")
 SEQUENCES_DIR = DATA_ROOT / "sequences"
 ANNOTATIONS_DIR = DATA_ROOT / "annotations"
@@ -58,9 +67,28 @@ OUT_GATE_LOG = Path(os.getenv("NCKH_OUT_GATE_LOG", "results/output_gate_log.json
 OUT_METRICS = Path(os.getenv("NCKH_OUT_METRICS", "results/system_metrics_unified.csv"))
 COORDINATOR_RULES = Path("config/coordinator_rules.json")
 TAU_PATH = Path("config/tau_val.json")
-RISK_DATASET_PATH = Path("zip_extract_full/artifacts/risk_dataset.csv")
+RISK_DATASET_PATH = Path("final_extracted/artifacts/risk_dataset.csv")
 
+# ===== HỢP ĐỒNG ĐẶC TRƯNG (schema v2) =====
+# 25 đặc trưng này phải khớp 1:1 với 2 notebook Kaggle
+# (notebook4234ae1bfe.ipynb và notebook426604c70d.ipynb) ở cả thứ tự lẫn cách tính.
+# 4 đặc trưng chẩn đoán (DROPPED_FEATURES) vẫn được tính để runtime còn nạp được
+# model 21-feature cũ (LEGACY_FEATURES) và để đối chiếu với notebook.
 FEATURES = [
+    # chất lượng detection / appearance
+    "conf", "conf_std5", "conf_delta", "conf_mean5", "conf_slope5",
+    "lap_var_log", "brightness", "motion_blur_ratio", "crop_contrast",
+    # độ ổn định track theo thời gian
+    "track_age", "hit_ratio", "time_since_update",
+    "speed_norm", "pred_uncert", "iou_prev", "scale_change",
+    # hình học / phối cảnh
+    "min_side_px", "area_norm", "height_norm", "center_y_norm", "dist_edge",
+    # bối cảnh đám đông / detection
+    "nearest_dist_norm", "n_neighbors_r2_norm", "overlap_max",
+    "n_det_expected_ratio",
+]
+DROPPED_FEATURES = ["track_state", "aspect_dev", "is_trunc", "frame_det_delta"]
+LEGACY_FEATURES = [
     "conf", "conf_std5", "conf_delta", "track_age", "hit_ratio",
     "time_since_update", "track_state", "min_side_px", "aspect_dev",
     "dist_edge", "is_trunc", "speed_norm", "pred_uncert", "lap_var_log",
@@ -68,7 +96,35 @@ FEATURES = [
     "n_neighbors_r2_norm", "overlap_max", "frame_det_delta",
     "n_det_expected_ratio",
 ]
+FEATURE_POOL = list(dict.fromkeys(FEATURES + DROPPED_FEATURES + LEGACY_FEATURES))
+assert len(FEATURES) == 25, len(FEATURES)
 
+
+def resolve_feature_names(model: Any) -> list[str]:
+    """Chọn đúng danh sách đặc trưng theo model đang nạp.
+
+    - Payload calibrated do notebook train ghi ra có khóa `features`.
+    - Model XGBoost thô thì dựa vào `n_features_in_` (25 mới / 21 cũ).
+    Nhờ vậy step5 chạy được cả model cũ lẫn model mới mà không cần sửa file.
+    """
+    if isinstance(model, dict) and model.get("features"):
+        names = [str(f) for f in model["features"]]
+    else:
+        inner = model["model"] if isinstance(model, dict) and "model" in model else model
+        n_in = getattr(inner, "n_features_in_", None)
+        if n_in == len(FEATURES):
+            names = list(FEATURES)
+        elif n_in == len(LEGACY_FEATURES):
+            names = list(LEGACY_FEATURES)
+        else:
+            names = list(FEATURES)
+    missing = [f for f in names if f not in FEATURE_POOL]
+    if missing:
+        raise ValueError(f"Model yêu cầu đặc trưng runtime không tính được: {missing}")
+    return names
+
+# Giá trị mặc định; sẽ được override bởi config/eval_config.json trong main()
+# để đảm bảo đồng nhất chỉ số giữa hệ thống và notebook huấn luyện Kaggle.
 IMG_SIZE = 1024
 # Ghi video ra file là tùy chọn: tắt mặc định để tránh lỗi FFmpeg
 # "Failed to write frame" trên môi trường không có encoder tương thích.
@@ -85,7 +141,7 @@ PROTECT_PADDING = 0.15
 # Cho phép chạy nhanh để so sánh backend mà không sửa code:
 #   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
 DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "pytorch")
-ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "zip_extract_full/artifacts/yolo26s.onnx"))
+ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "final_extracted/artifacts/yolo26s.onnx"))
 MAX_SEQS = int(os.getenv("NCKH_MAX_SEQS", "0"))  # 0 = tất cả sequence
 MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "200"))
 WARMUP_FRAMES = 30
@@ -117,12 +173,42 @@ def load_tau() -> float:
     return 0.5
 
 
+def load_eval_config() -> dict[str, Any]:
+    """Đọc cấu hình đánh giá dùng chung từ config/eval_config.json.
+
+    File này được thiết kế để dùng đồng nhất giữa step5_integrated_system.py
+    và notebook huấn luyện trên Kaggle, giúp các chỉ số (AP, precision,
+    recall, ...) tính toán giống hệt nhau ở cả hai nơi.
+    """
+    cfg_path = Path("config/eval_config.json")
+    default_cfg = {
+        "conf_thres": 0.25,
+        "iou_thres": 0.70,
+        "img_size": 1024,
+        "device": "cpu",
+        "half": False,
+        "iou_match_threshold": 0.5,
+        "exclude_occlusion_2": True,
+        "category_person": 1,
+        "max_frames_per_seq": 200,
+        "warmup_frames": 30,
+    }
+    if cfg_path.exists():
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        # Gộp với default để tránh thiếu khóa
+        for k, v in default_cfg.items():
+            cfg.setdefault(k, v)
+        return cfg
+    return default_cfg
+
+
 def load_risk_model() -> Any:
     """Tải model calibration nếu hợp lệ, ngược lại fallback về XGBoost thô.
 
-    File models/xgboost_risk_calibrated.joblib trong artifact có thể bị hỏng
+    File final_extracted/xgboost_risk_calibrated.joblib trong artifact có thể bị hỏng
     (joblib báo "input stream corrupted"). Trường hợp đó chỉ ghi cảnh báo ngắn
-    gọn và dùng models/xgboost_risk.json.
+    gọn và dùng final_extracted/xgboost_risk.json.
     """
     if RISK_CALIBRATED_PATH.exists() and _HAS_JOBLIB:
         try:
@@ -341,33 +427,6 @@ def load_annotations(seq_name: str) -> dict[int, list[list[float]]]:
     return gt
 
 
-def iou(box1: list[float], box2: list[float]) -> float:
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = max(0, box1[2] - box1[0]) * max(0, box1[3] - box1[1])
-    area2 = max(0, box2[2] - box2[0]) * max(0, box2[3] - box2[1])
-    union = area1 + area2 - inter
-    return inter / union if union > 0 else 0.0
-
-
-def containment(gt_box: list[float], cover_box: list[float]) -> float:
-    """Tỷ lệ diện tích GT box nằm trong cover box (0..1).
-
-    Phù hợp để đo mức che phủ vì protect box được mở rộng (ROI padding) nên
-    IoU sẽ bị giảm dù GT vẫn được che hoàn toàn.
-    """
-    x1 = max(gt_box[0], cover_box[0])
-    y1 = max(gt_box[1], cover_box[1])
-    x2 = min(gt_box[2], cover_box[2])
-    y2 = min(gt_box[3], cover_box[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    gt_area = max(0, gt_box[2] - gt_box[0]) * max(0, gt_box[3] - gt_box[1])
-    return inter / gt_area if gt_area > 0 else 0.0
-
-
 def expand_box(box: list[float], padding: float, img_w: int, img_h: int) -> list[float]:
     x1, y1, x2, y2 = box
     cx = (x1 + x2) / 2.0
@@ -429,129 +488,6 @@ def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
                ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
     return float(ssim_map.mean())
-
-
-def expected_calibration_error(y_true: np.ndarray, prob: np.ndarray, bins: int = 10) -> float:
-    edges = np.linspace(0.0, 1.0, bins + 1)
-    ece = 0.0
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        mask = (prob >= lo) & (prob < hi if hi < 1 else prob <= hi)
-        if mask.any():
-            ece += float(mask.mean()) * abs(float(prob[mask].mean()) - float(y_true[mask].mean()))
-    return ece
-
-
-def average_precision(
-    preds_by_frame: dict[str, dict[int, list[tuple[list[float], float]]]],
-    gts_by_frame: dict[str, dict[int, list[list[float]]]],
-    iou_thresholds: list[float],
-) -> dict[float, float]:
-    """Tính Average Precision (COCO style) tại các ngưỡng IoU.
-
-    preds_by_frame: seq -> frame -> list of (box, conf)
-    gts_by_frame: seq -> frame -> list of box
-    Trả về dict {iou_threshold: AP}.
-
-    AP được tính bằng cách integral của precision-recall envelope
-    tại 101 ngưỡng recall (0.00, 0.01, ..., 1.00), chuẩn COCO.
-    """
-    # Gom tất cả detection thành danh sách (seq, frame, box, conf)
-    all_dets: list[tuple[str, int, list[float], float]] = []
-    total_gt = 0
-    for seq, seq_gts in gts_by_frame.items():
-        seq_preds = preds_by_frame.get(seq, {})
-        for frame_number, gts in seq_gts.items():
-            total_gt += len(gts)
-            dets = seq_preds.get(frame_number, [])
-            for box, conf in dets:
-                all_dets.append((seq, frame_number, box, conf))
-
-    # Sort theo conf giảm dần
-    all_dets.sort(key=lambda x: x[3], reverse=True)
-
-    aps: dict[float, float] = {}
-    for iou_thr in iou_thresholds:
-        tp = np.zeros(len(all_dets), dtype=np.float64)
-        fp = np.zeros(len(all_dets), dtype=np.float64)
-        # Đánh dấu GT đã match (seq, frame, gt_idx)
-        matched_gt: set[tuple[str, int, int]] = set()
-        for i, (seq, frame_number, box, conf) in enumerate(all_dets):
-            gts = gts_by_frame.get(seq, {}).get(frame_number, [])
-            best_iou = 0.0
-            best_gt_idx = -1
-            for j, gt in enumerate(gts):
-                if (seq, frame_number, j) in matched_gt:
-                    continue
-                iou_val = iou(box, gt)
-                if iou_val > best_iou:
-                    best_iou = iou_val
-                    best_gt_idx = j
-            if best_iou >= iou_thr and best_gt_idx >= 0:
-                tp[i] = 1.0
-                matched_gt.add((seq, frame_number, best_gt_idx))
-            else:
-                fp[i] = 1.0
-
-        cum_tp = np.cumsum(tp)
-        cum_fp = np.cumsum(fp)
-        recalls = cum_tp / max(1, total_gt)
-        precisions = cum_tp / np.maximum(cum_tp + cum_fp, 1e-9)
-        # COCO AP: integral of precision-recall envelope at 101 recall points
-        ap = 0.0
-        for t in np.linspace(0.0, 1.0, 101):
-            p_at_recall = precisions[recalls >= t].max() if np.any(recalls >= t) else 0.0
-            ap += p_at_recall
-        aps[iou_thr] = float(ap / 101.0)
-    return aps
-
-
-def mota_motp(
-    gt_all: dict[str, dict[int, list[list[float]]]],
-    pred_all: dict[str, dict[int, list[list[float]]]],
-) -> dict[str, float]:
-    """Tính MOTA và MOTP dựa trên matching một-một theo frame tại IoU >= 0.5.
-
-    VisDrone VID test-dev không cung cấp track ID ground-truth, nên IDSW
-    không thể tính chính xác. Ở đây IDSW coi là 0 (không theo dõi liên tục).
-    """
-    total_gt = total_tp = total_fp = total_fn = 0
-    iou_sum = 0.0
-    iou_count = 0
-    for seq, seq_gt in gt_all.items():
-        seq_pred = pred_all.get(seq, {})
-        for frame_number, gts in seq_gt.items():
-            preds = seq_pred.get(frame_number, [])
-            total_gt += len(gts)
-            if not gts or not preds:
-                total_fp += len(preds)
-                total_fn += len(gts)
-                continue
-            ious = np.array(
-                [[iou(pred, gt) for gt in gts] for pred in preds],
-                dtype=np.float64,
-            )
-            match_cost = np.where(ious >= 0.5, -1.0 - ious * 1e-6, 0.0)
-            pred_indices, gt_indices = linear_sum_assignment(match_cost)
-            matched_pairs = [(p, g) for p, g in zip(pred_indices, gt_indices)
-                             if ious[p, g] >= 0.5]
-            matched = len(matched_pairs)
-            total_tp += matched
-            total_fp += len(preds) - matched
-            total_fn += len(gts) - matched
-            for p, g in matched_pairs:
-                iou_sum += float(ious[p, g])
-                iou_count += 1
-
-    mota = 1.0 - (total_fn + total_fp) / max(1, total_gt)  # IDSW = 0
-    motp = iou_sum / max(1, iou_count)
-    return {
-        "mota": float(mota),
-        "motp": float(motp),
-        "total_gt": int(total_gt),
-        "total_tp": int(total_tp),
-        "total_fp": int(total_fp),
-        "total_fn": int(total_fn),
-    }
 
 
 def compute_metrics(
@@ -627,15 +563,15 @@ def compute_metrics(
     avg_ssim = ssim_sum / max(1, ssim_count) if ssim_count > 0 else 0.0
 
     # AP@0.5 và AP@0.5:0.95 (COCO/VOC style) cho detector
-    detection_aps = average_precision(
-        detector_all, gt_all, iou_thresholds=[0.5, 0.5, 0.75]
+    detection_aps = average_precision_coco(
+        detector_all, gt_all, iou_thresholds=[0.5, 0.75]
     )
-    # average_precision trả về AP cho mỗi iou threshold; chúng ta lấy AP@0.5
+    # average_precision_coco trả về AP cho mỗi iou threshold; chúng ta lấy AP@0.5
     # và trung bình các ngưỡng 0.5:0.05:0.95 (COCO-style).
     ap50 = detection_aps.get(0.5, 0.0)
     # AP@0.5:0.95: tính trung bình AP tại các ngưỡng 0.5, 0.55, ..., 0.95
     ap_thresholds = [round(0.5 + 0.05 * i, 2) for i in range(10)]
-    detection_aps_all = average_precision(
+    detection_aps_all = average_precision_coco(
         detector_all, gt_all, iou_thresholds=ap_thresholds
     )
     ap50_95 = float(np.mean([detection_aps_all.get(t, 0.0) for t in ap_thresholds]))
@@ -700,6 +636,39 @@ def compute_metrics(
     return metrics
 
 
+def crop_quality_stats(
+    gray: np.ndarray,
+    box: list[float],
+    resize: int = CROP_RESIZE,
+) -> tuple[float, float, float]:
+    """Trả về (lap_var, brightness, contrast) của crop, giống hệt lúc train.
+
+    Notebook train cắt crop theo box của TRACKER rồi resize cạnh dài về
+    CROP_RESIZE trước khi tính Laplacian, nên runtime phải làm y như vậy;
+    nếu không `lap_var_log` / `crop_contrast` sẽ lệch phân phối.
+    """
+    h, w = gray.shape[:2]
+    x1, y1, x2, y2 = box
+    x1 = int(max(0, min(x1, w - 1)))
+    y1 = int(max(0, min(y1, h - 1)))
+    x2 = int(max(x1 + 1, min(x2, w)))
+    y2 = int(max(y1 + 1, min(y2, h)))
+    crop = gray[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 0.0, 0.5, 0.0
+    if resize and max(crop.shape[:2]) > resize:
+        s = resize / max(crop.shape[:2])
+        crop = cv2.resize(
+            crop,
+            (max(1, int(crop.shape[1] * s)), max(1, int(crop.shape[0] * s))),
+            interpolation=cv2.INTER_AREA,
+        )
+    lap = float(cv2.Laplacian(crop, cv2.CV_64F).var())
+    bright = float(crop.mean() / 255.0)
+    contrast = float(crop.std() / 255.0)
+    return lap, bright, contrast
+
+
 class TrackHistory:
     def __init__(self, track_id: int, first_frame: int):
         self.track_id = track_id
@@ -711,11 +680,23 @@ class TrackHistory:
         self.conf_history: list[float] = []
         self.center_history: list[tuple[float, float]] = []
         self.lap_history: list[float] = []
+        self.box_history: list[list[float]] = []
+        self.area_history: list[float] = []
+        self.brightness_history: list[float] = []
+        self.contrast_history: list[float] = []
         self.box: list[float] = [0.0, 0.0, 0.0, 0.0]
         self.conf: float = 0.5
 
-    def update(self, frame: int, box: list[float], conf: float, lap_var: float) -> None:
-        self.age += 1
+    def update(
+        self,
+        frame: int,
+        box: list[float],
+        conf: float,
+        lap_var: float,
+        brightness: float = 0.5,
+        contrast: float = 0.0,
+    ) -> None:
+        self.age = max(1, frame - self.first_frame + 1)
         self.hits += 1
         self.time_since_update = 0 if self.prev_frame is None else max(0, frame - self.prev_frame - 1)
         self.prev_frame = frame
@@ -726,9 +707,23 @@ class TrackHistory:
         cy = (box[1] + box[3]) / 2.0
         self.center_history.append((cx, cy))
         self.lap_history.append(lap_var)
+        self.box_history.append(list(box))
+        self.area_history.append(max(box[2] - box[0], 1e-6) * max(box[3] - box[1], 1e-6))
+        self.brightness_history.append(float(brightness))
+        self.contrast_history.append(float(contrast))
+        # Giới hạn bộ nhớ lịch sử với track rất dài.
+        keep = 64
+        for attr in (
+            "conf_history", "center_history", "lap_history", "box_history",
+            "area_history", "brightness_history", "contrast_history",
+        ):
+            hist = getattr(self, attr)
+            if len(hist) > keep:
+                setattr(self, attr, hist[-keep:])
 
     def mark_missed(self, frame: int) -> None:
         self.time_since_update += 1
+        self.age = max(1, frame - self.first_frame + 1)
 
     @property
     def track_state_code(self) -> float:
@@ -757,15 +752,28 @@ class TrackHistory:
         cy = (box[1] + box[3]) / 2.0
 
         f_conf = conf
-        c5 = self.conf_history[-(CONF_WINDOW - 1):] + [conf] if CONF_WINDOW > 1 else [conf]
+        # conf_history đã chứa conf hiện tại (update() gọi trước compute_features).
+        c5 = self.conf_history[-CONF_WINDOW:] if CONF_WINDOW > 1 else [conf]
         f_conf_std5 = float(np.std(c5)) if len(c5) > 1 else 0.0
         f_conf_delta = 0.0 if len(self.conf_history) < 2 else conf - self.conf_history[-2]
+        f_conf_mean5 = float(np.mean(c5)) if c5 else conf
+        f_conf_slope5 = 0.0
+        if len(c5) >= 2:
+            x = np.arange(len(c5), dtype=np.float64)
+            xm = float(x.mean())
+            denom = float(((x - xm) ** 2).sum())
+            if denom > 0:
+                y = np.asarray(c5, dtype=np.float64)
+                f_conf_slope5 = float(((x - xm) * (y - y.mean())).sum() / denom)
         f_track_age = float(self.age)
         f_hit_ratio = min(1.0, self.hits / max(self.age, 1))
         f_time_since_update = float(self.time_since_update)
         f_track_state = self.track_state_code
         f_min_side_px = float(min(bw, bh))
         f_aspect_dev = float(abs(bw / bh - r_ref))
+        f_area_norm = float((bw * bh) / max(img_w * img_h, 1.0))
+        f_height_norm = float(bh / max(img_h, 1.0))
+        f_center_y_norm = float(cy / max(img_h, 1.0))
         f_dist_edge = float(max(0.0, min(box[0], box[1], img_w - box[2], img_h - box[3]) / D))
         f_is_trunc = 1.0 if min(box[0], box[1], img_w - box[2], img_h - box[3]) <= TRUNC_MARGIN_PX else 0.0
         f_speed_norm = 0.0
@@ -776,8 +784,16 @@ class TrackHistory:
         if len(cen_win) > 1:
             arr = np.array(cen_win)
             f_pred_uncert = float(np.sqrt(arr[:, 0].var() + arr[:, 1].var()) / D)
+        f_iou_prev = 0.0
+        f_scale_change = 0.0
+        if len(self.box_history) >= 2:
+            f_iou_prev = float(iou(self.box_history[-2], box))
+            prev_area = self.area_history[-2]
+            if prev_area > 0:
+                f_scale_change = float(np.clip(math.log(max(self.area_history[-1], 1e-6) / prev_area), -5.0, 5.0))
         f_lap_var_log = float(math.log1p(self.lap_history[-1])) if self.lap_history else 0.0
-        f_brightness = 0.5
+        f_brightness = float(self.brightness_history[-1]) if self.brightness_history else 0.5
+        f_crop_contrast = float(self.contrast_history[-1]) if self.contrast_history else 0.0
         f_motion_blur_ratio = 0.0
         if len(self.lap_history) >= 2:
             L_prev = self.lap_history[-2]
@@ -798,7 +814,8 @@ class TrackHistory:
                 dists[my_idx] = np.inf
                 f_nearest_dist_norm = float(np.clip(dists.min() / D, 0, 1))
                 radius = NEIGHBOR_RADIUS_FRAC * D
-                n_nb = int((dists <= radius).sum()) - 1
+                # dists[my_idx] đã là inf nên không trừ 1 (khớp notebook).
+                n_nb = int((dists <= radius).sum())
                 f_n_neighbors_r2_norm = float(min(n_nb / NEIGHBOR_K, 1.0))
                 ious = []
                 for j, b2 in enumerate(all_boxes_frame):
@@ -818,24 +835,34 @@ class TrackHistory:
             "conf": f_conf,
             "conf_std5": f_conf_std5,
             "conf_delta": f_conf_delta,
-            "track_age": f_track_age,
-            "hit_ratio": f_hit_ratio,
-            "time_since_update": f_time_since_update,
-            "track_state": f_track_state,
-            "min_side_px": f_min_side_px,
-            "aspect_dev": f_aspect_dev,
-            "dist_edge": f_dist_edge,
-            "is_trunc": f_is_trunc,
-            "speed_norm": f_speed_norm,
-            "pred_uncert": f_pred_uncert,
+            "conf_mean5": f_conf_mean5,
+            "conf_slope5": f_conf_slope5,
             "lap_var_log": f_lap_var_log,
             "brightness": f_brightness,
             "motion_blur_ratio": f_motion_blur_ratio,
+            "crop_contrast": f_crop_contrast,
+            "track_age": f_track_age,
+            "hit_ratio": f_hit_ratio,
+            "time_since_update": f_time_since_update,
+            "speed_norm": f_speed_norm,
+            "pred_uncert": f_pred_uncert,
+            "iou_prev": f_iou_prev,
+            "scale_change": f_scale_change,
+            "min_side_px": f_min_side_px,
+            "area_norm": f_area_norm,
+            "height_norm": f_height_norm,
+            "center_y_norm": f_center_y_norm,
+            "dist_edge": f_dist_edge,
             "nearest_dist_norm": f_nearest_dist_norm,
             "n_neighbors_r2_norm": f_n_neighbors_r2_norm,
             "overlap_max": f_overlap_max,
-            "frame_det_delta": f_frame_det_delta,
             "n_det_expected_ratio": f_n_det_expected_ratio,
+            # 4 đặc trưng chẩn đoán (không dùng cho model 25-feature,
+            # nhưng giữ để nạp được model 21-feature cũ).
+            "track_state": f_track_state,
+            "aspect_dev": f_aspect_dev,
+            "is_trunc": f_is_trunc,
+            "frame_det_delta": f_frame_det_delta,
         }
 
 
@@ -939,11 +966,15 @@ def run_sequence(
     frame_idx = 0
     last_detect_frame = -10000
     prev_det_count: int | None = None
+    prev_n_tracks: int | None = None
     ewma_det: float | None = None
     prev_frame_risk_level: str | None = None
 
     track_histories: dict[int, TrackHistory] = {}
-    risk_standardizer = SequenceStandardizer(len(FEATURES))
+    # Danh sách đặc trưng lấy theo payload model: model 25-feature mới dùng FEATURES,
+    # model 21-feature cũ vẫn tự fallback về LEGACY_FEATURES.
+    feature_names = resolve_feature_names(risk_model)
+    risk_standardizer = SequenceStandardizer(len(feature_names))
 
     tracker_args = SimpleNamespace(
         track_high_thresh=TRACK_HIGH_THRESH,
@@ -1099,39 +1130,29 @@ def run_sequence(
                     track_histories[int(tid)] = TrackHistory(int(tid), frame_idx)
                 th = track_histories[int(tid)]
 
-                lap_var = 0.0
-                if should_detect and len(detections_np) > 0:
-                    best_iou = 0.0
-                    best_idx = -1
-                    for i, det in enumerate(detections_np):
-                        iou_val = iou([float(x1), float(y1), float(x2), float(y2)],
-                                      [float(det[0]), float(det[1]), float(det[2]), float(det[3])])
-                        if iou_val > best_iou:
-                            best_iou = iou_val
-                            best_idx = i
-                    if best_idx >= 0:
-                        x1, y1, x2, y2 = [int(v) for v in detections_np[best_idx, :4]]
-                        x1 = max(0, min(x1, w - 1)); y1 = max(0, min(y1, h - 1))
-                        x2 = max(x1 + 1, min(x2, w)); y2 = max(y1 + 1, min(y2, h))
-                        crop = gray[y1:y2, x1:x2]
-                        lap_var = float(cv2.Laplacian(crop, cv2.CV_64F).var()) if crop.size > 0 else 0.0
-                else:
-                    lap_var = th.lap_history[-1] if th.lap_history else 0.0
-
-                th.update(frame_idx, [float(x1), float(y1), float(x2), float(y2)], float(score), lap_var)
+                # Thống kê crop tính trên box của TRACKER ở frame hiện tại,
+                # đúng bằng dữ liệu lúc train (features_frame.csv dùng box track),
+                # và tính mỗi frame để brightness/contrast/lap khớp notebook.
+                lap_var, bright_cur, contrast_cur = crop_quality_stats(
+                    gray, [float(x1), float(y1), float(x2), float(y2)]
+                )
+                th.update(
+                    frame_idx, [float(x1), float(y1), float(x2), float(y2)],
+                    float(score), lap_var, bright_cur, contrast_cur,
+                )
 
         current_ids = set(track_ids)
         for tid, th in track_histories.items():
             if tid not in current_ids:
                 th.mark_missed(frame_idx)
 
-        if should_detect:
-            N_t = len(detections_np)
-            expected = N_t if ewma_det is None else ewma_det
-            ewma_det = N_t if ewma_det is None else EWMA_ALPHA * N_t + (1 - EWMA_ALPHA) * ewma_det
-            prev_det_count = N_t
-        else:
-            prev_det_count = len(track_boxes)
+        # Đếm số track mỗi frame (khớp notebook: N = số dòng tracker trong frame),
+        # dùng EWMA của quá khứ nên phải lấy giá trị TRƯỚC khi cập nhật.
+        N_t = len(track_boxes)
+        prev_det_count = prev_n_tracks
+        ewma_prev = ewma_det
+        ewma_det = N_t if ewma_det is None else EWMA_ALPHA * N_t + (1 - EWMA_ALPHA) * ewma_det
+        prev_n_tracks = N_t
 
         all_boxes_frame = track_boxes
         frame_risk = 0.0
@@ -1145,22 +1166,12 @@ def run_sequence(
                 img_w=w,
                 img_h=h,
                 all_boxes_frame=all_boxes_frame,
-                prev_det_count=prev_det_count if should_detect else None,
-                ewma_det=ewma_det,
+                prev_det_count=prev_det_count,
+                ewma_det=ewma_prev,
                 r_ref=r_ref,
             )
 
-            if should_detect and tid in track_ids:
-                idx = track_ids.index(tid)
-                x1, y1, x2, y2 = [int(v) for v in track_boxes[idx]]
-                x1 = max(0, min(x1, w - 1)); y1 = max(0, min(y1, h - 1))
-                x2 = max(x1 + 1, min(x2, w)); y2 = max(y1 + 1, min(y2, h))
-                crop = frame[y1:y2, x1:x2]
-                if crop.size > 0:
-                    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                    feat["brightness"] = float(gray_crop.mean() / 255.0)
-
-            X = np.array([feat[f] for f in FEATURES], dtype=np.float32)
+            X = np.array([feat[f] for f in feature_names], dtype=np.float32)
             X_norm = risk_standardizer.transform(X).reshape(1, -1)
             risk_prob = predict_risk(risk_model, X_norm)
             # Chỉ ghi nhận cặp (y_true, y_prob) khi có ground truth label khớp
@@ -1291,9 +1302,24 @@ def run_sequence(
 
 
 def main() -> None:
+    global IMG_SIZE, CONF_THRES, IOU_THRES, MAX_FRAMES_PER_SEQ, WARMUP_FRAMES
+
     OUT_VIDEO.parent.mkdir(parents=True, exist_ok=True)
     OUT_GATE_LOG.parent.mkdir(parents=True, exist_ok=True)
     OUT_METRICS.parent.mkdir(parents=True, exist_ok=True)
+
+    # Đồng nhất các tham số inference từ config dùng chung (cùng Kaggle)
+    eval_cfg = load_eval_config()
+    IMG_SIZE = int(eval_cfg.get("img_size", IMG_SIZE))
+    CONF_THRES = float(eval_cfg.get("conf_thres", CONF_THRES))
+    IOU_THRES = float(eval_cfg.get("iou_thres", IOU_THRES))
+    MAX_FRAMES_PER_SEQ = int(eval_cfg.get("max_frames_per_seq", MAX_FRAMES_PER_SEQ))
+    WARMUP_FRAMES = int(eval_cfg.get("warmup_frames", WARMUP_FRAMES))
+    print(
+        f"[Bước 5] Eval config: img_size={IMG_SIZE}, conf_thres={CONF_THRES}, "
+        f"iou_thres={IOU_THRES}, max_frames_per_seq={MAX_FRAMES_PER_SEQ}, "
+        f"warmup_frames={WARMUP_FRAMES}"
+    )
 
     if not WEIGHTS_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy mô hình detect: {WEIGHTS_PATH}")

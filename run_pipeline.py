@@ -6,8 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 STEPS = [
-    ("Bước 5: Tích hợp hệ thống hoàn chỉnh", "step5_integrated_system.py"),
+    ("Bước 5: Tích hợp hệ thống hoàn chỉnh (test-dev)", "step5_integrated_system.py"),
     ("Bước 6: Đo hiệu năng phần cứng", "step6_hardware_benchmark.py"),
 ]
 
@@ -30,10 +36,11 @@ def main() -> None:
     print("TẤT CẢ CÁC BƯỚC ĐÃ HOÀN TẤT")
     print("=" * 60)
     print("Kết quả chính:")
-    print(" - results/system_metrics_unified.csv  (chỉ số đánh giá hệ thống)")
-    print(" - results/hardware_benchmark.csv      (hiệu năng phần cứng)")
-    print(" - results/output_gate_log.json        (nhật ký chặn đầu ra)")
-    print(" - outputs/protected_video.mp4         (video đã che đối tượng)")
+    print(" - results/system_metrics_unified.csv   (chỉ số đánh giá hệ thống, test-dev)")
+    print(" - results/val_tracking_metrics.csv     (chỉ số tracking, valset)")
+    print(" - results/hardware_benchmark.csv       (hiệu năng phần cứng)")
+    print(" - results/output_gate_log.json         (nhật ký chặn đầu ra)")
+    print(" - outputs/protected_video.mp4          (video đã che đối tượng)")
 
 
 if __name__ == "__main__":

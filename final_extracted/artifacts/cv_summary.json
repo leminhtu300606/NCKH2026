@@ -1,0 +1,260 @@
+{
+  "source_csv": "E:\\NCKH2026\\zip_extract_full\\artifacts\\risk_dataset.csv",
+  "n_samples": 35525,
+  "n_train": 23164,
+  "n_val": 6844,
+  "n_test": 5517,
+  "positives": {
+    "train": 2459,
+    "val": 1753,
+    "test": 154
+  },
+  "neg_pos_ratio": 2.0,
+  "feature_agg": "last",
+  "feature_schema_version": 2,
+  "features": [
+    "conf",
+    "conf_std5",
+    "conf_delta",
+    "conf_mean5",
+    "conf_slope5",
+    "lap_var_log",
+    "brightness",
+    "motion_blur_ratio",
+    "crop_contrast",
+    "track_age",
+    "hit_ratio",
+    "time_since_update",
+    "speed_norm",
+    "pred_uncert",
+    "iou_prev",
+    "scale_change",
+    "min_side_px",
+    "area_norm",
+    "height_norm",
+    "center_y_norm",
+    "dist_edge",
+    "nearest_dist_norm",
+    "n_neighbors_r2_norm",
+    "overlap_max",
+    "n_det_expected_ratio"
+  ],
+  "dropped_features": [
+    "track_state",
+    "aspect_dev",
+    "is_trunc",
+    "frame_det_delta"
+  ],
+  "feature_groups": {
+    "detection_quality": [
+      "conf",
+      "conf_std5",
+      "conf_delta",
+      "conf_mean5",
+      "conf_slope5",
+      "lap_var_log",
+      "brightness",
+      "motion_blur_ratio",
+      "crop_contrast"
+    ],
+    "track_stability": [
+      "track_age",
+      "hit_ratio",
+      "time_since_update",
+      "speed_norm",
+      "pred_uncert",
+      "iou_prev",
+      "scale_change"
+    ],
+    "geometry": [
+      "min_side_px",
+      "area_norm",
+      "height_norm",
+      "center_y_norm",
+      "dist_edge"
+    ],
+    "crowd_context": [
+      "nearest_dist_norm",
+      "n_neighbors_r2_norm",
+      "overlap_max",
+      "n_det_expected_ratio"
+    ]
+  },
+  "normalization": "causal per-sequence z-score (Welford, min_n=50), per split",
+  "protocol": "GroupKFold(sequence) OOF on train; early stopping on inner sequence holdout; val for tau; test untouched",
+  "params": {
+    "n_estimators": 50,
+    "max_depth": 3,
+    "learning_rate": 0.03,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 10,
+    "reg_lambda": 5.0,
+    "reg_alpha": 0.5,
+    "objective": "binary:logistic",
+    "eval_metric": "aucpr",
+    "tree_method": "hist",
+    "random_state": 42,
+    "scale_pos_weight": 5.0
+  },
+  "n_trees_per_fold": [
+    20,
+    1,
+    2,
+    71,
+    1
+  ],
+  "n_estimators_final": 50,
+  "n_splits": 5,
+  "folds": [
+    {
+      "fold": 0,
+      "n_train_fit": 3527,
+      "n_early_stop": 2072,
+      "n_val": 9946,
+      "pos_val": 604,
+      "neg_pos_ratio": 1.9713563605728728,
+      "auc": 0.7241016856154857,
+      "pr_auc": 0.11587204384563753,
+      "n_trees": 20
+    },
+    {
+      "fold": 1,
+      "n_train_fit": 4530,
+      "n_early_stop": 1233,
+      "n_val": 3280,
+      "pos_val": 555,
+      "neg_pos_ratio": 2.0443548387096775,
+      "auc": 0.7241021572030746,
+      "pr_auc": 0.3108665827058119,
+      "n_trees": 1
+    },
+    {
+      "fold": 2,
+      "n_train_fit": 3871,
+      "n_early_stop": 2751,
+      "n_val": 3340,
+      "pos_val": 263,
+      "neg_pos_ratio": 2.026583268178264,
+      "auc": 0.6169612394671122,
+      "pr_auc": 0.11540986324658063,
+      "n_trees": 2
+    },
+    {
+      "fold": 3,
+      "n_train_fit": 5223,
+      "n_early_stop": 568,
+      "n_val": 3292,
+      "pos_val": 545,
+      "neg_pos_ratio": 2.0295823665893273,
+      "auc": 0.650842453652525,
+      "pr_auc": 0.3596294879791589,
+      "n_trees": 71
+    },
+    {
+      "fold": 4,
+      "n_train_fit": 3378,
+      "n_early_stop": 2491,
+      "n_val": 3306,
+      "pos_val": 492,
+      "neg_pos_ratio": 2.0,
+      "auc": 0.4249159255984884,
+      "pr_auc": 0.13942484513837017,
+      "n_trees": 1
+    }
+  ],
+  "oof_auc": 0.61848179253498,
+  "oof_pr_auc": 0.1777725403304553,
+  "calibration": {
+    "method": "isotonic on OOF",
+    "n_oof": 23164
+  },
+  "tau": {
+    "tau": 0.18806509945750452,
+    "method": "target_fpr_val",
+    "target_fpr": 0.05,
+    "achieved_tpr": 0.16086708499714775,
+    "achieved_fpr": 0.0923197800039285,
+    "tau_youden": 0.07696429704008015,
+    "youden_j": 0.1795574956779203,
+    "n_val": 6844,
+    "n_positive": 1753,
+    "evaluation": "sequence-disjoint hold-out (val split)"
+  },
+  "split_metrics": {
+    "train": {
+      "raw": {
+        "n": 23164,
+        "positive_rate": 0.10615610429977551,
+        "auc": 0.9176769289224224,
+        "pr_auc": 0.6457327144791613,
+        "brier": 0.2722747893793056,
+        "ece": 0.4390803860441594
+      },
+      "calibrated": {
+        "n": 23164,
+        "positive_rate": 0.10615610429977551,
+        "auc": 0.9132017980659193,
+        "pr_auc": 0.5809549339932937,
+        "brier": 0.06831342965626065,
+        "ece": 0.04405283171456976
+      }
+    },
+    "val": {
+      "raw": {
+        "n": 6844,
+        "positive_rate": 0.2561367621274109,
+        "auc": 0.587469380716482,
+        "pr_auc": 0.33331886426891966,
+        "brier": 0.2844222535233807,
+        "ece": 0.28952753919648677
+      },
+      "calibrated": {
+        "n": 6844,
+        "positive_rate": 0.2561367621274109,
+        "auc": 0.5799211341603355,
+        "pr_auc": 0.318690768466002,
+        "brier": 0.21672516292593988,
+        "ece": 0.1763484580590531
+      },
+      "confusion_at_tau": [
+        [
+          4621,
+          470
+        ],
+        [
+          1471,
+          282
+        ]
+      ]
+    },
+    "test": {
+      "raw": {
+        "n": 5517,
+        "positive_rate": 0.027913721225303608,
+        "auc": 0.6111251698143364,
+        "pr_auc": 0.04845021716454867,
+        "brier": 0.3275244452537276,
+        "ece": 0.5221220585953958
+      },
+      "calibrated": {
+        "n": 5517,
+        "positive_rate": 0.027913721225303608,
+        "auc": 0.6076695540148831,
+        "pr_auc": 0.047765058886274844,
+        "brier": 0.054139074428723566,
+        "ece": 0.07573770340026166
+      },
+      "confusion_at_tau": [
+        [
+          4762,
+          601
+        ],
+        [
+          104,
+          50
+        ]
+      ]
+    }
+  }
+}

@@ -12,5 +12,6 @@
   "roi_expand_critical": 0.7,
   "output_gate_block_threshold": 0.526,
   "containment_block_threshold": 0.9,
-  "enable_containment_gate": true
+  "enable_containment_gate": true,
+  "onnx_conf_thres": 0.05
 }

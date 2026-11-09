@@ -30,15 +30,14 @@ B1 đến B8 là các operating point của cùng pipeline:
 
 ## Thành phần và dữ liệu
 
-- [models/best.pt](models/best.pt): detector *person*.
-- [models/xgboost_risk.json](models/xgboost_risk.json): XGBoost artifact
-  từ archive, với 21 feature, train trên dữ liệu *person*.
-- [zip_extract_full/artifacts](zip_extract_full/artifacts): risk dataset, OOF predictions,
-  feature schema, CV summary và metric gốc trong ZIP; toàn bộ sample là
-  *person track*.
-- [zip_extract_full/artifacts/risk_model.json.metadata.json](zip_extract_full/artifacts/risk_model.json.metadata.json):
+- [final_extracted/artifacts/yolo26s.pt](final_extracted/artifacts/yolo26s.pt): detector *person*.
+- [final_extracted/artifacts/risk_model.json](final_extracted/artifacts/risk_model.json): XGBoost artifact
+  từ archive, với 25 feature (schema v2), train trên dữ liệu *person*.
+- [final_extracted/artifacts](final_extracted/artifacts): risk dataset, OOF predictions,
+  feature schema, CV summary và metric gốc; toàn bộ sample là *person track*.
+- [final_extracted/artifacts/risk_model.json.metadata.json](final_extracted/artifacts/risk_model.json.metadata.json):
   thứ tự feature bắt buộc khi phục vụ model.
-- [zip_extract_full/artifacts/feature_schema.json](zip_extract_full/artifacts/feature_schema.json): định nghĩa
+- [final_extracted/artifacts/feature_schema.json](final_extracted/artifacts/feature_schema.json): định nghĩa
   feature, tất cả mô tả đặc trưng *person track*.
 - [config/tau_val.json](config/tau_val.json): ngưỡng được chọn trên
   validation sequence-disjoint.
@@ -48,7 +47,7 @@ B1 đến B8 là các operating point của cùng pipeline:
 - [visdrone-train](visdrone-train): dữ liệu dùng để xây detector export, không
   phải bảng feature huấn luyện XGBoost; chỉ dùng cho detector *person*.
 
-risk_dataset.csv trong [zip_extract_full/artifacts](zip_extract_full/artifacts) là bảng dữ
+risk_dataset.csv trong [final_extracted/artifacts](final_extracted/artifacts) là bảng dữ
 liệu huấn luyện/đánh giá được đóng gói trong ZIP. Archive ghi nhận tracking
 chưa hoàn tất (completed=false, 52/80 sequence), nên metric risk archive
 được báo cáo đúng trạng thái và không được trộn với metric video end-to-end.
@@ -122,14 +121,14 @@ $env:NCKH_BACKEND="onnx";     python step5_integrated_system.py    # fallback Py
 $env:NCKH_BACKEND="openvino"; python step5_integrated_system.py    # fallback PyTorch (cảnh báo)
 ```
 
-Các file ONNX (`models/best_raw_dyn.onnx`, `models/best_raw.onnx`) chỉ giữ
+Các file ONNX (`final_extracted/artifacts/yolo26s.onnx`) chỉ giữ
 làm tham chiếu cho Bước 6 / xuất mô hình; chưa dùng trực tiếp trong Bước 5.
 Chỉnh nhanh phạm vi đánh giá: `NCKH_MAX_SEQS`, `NCKH_MAX_FRAMES`,
 `NCKH_OUT_METRICS`, `NCKH_OUT_GATE_LOG`.
 
 Bước 6 đo latency trên 1 frame thật (1360x765), 100 lần sau warm-up 10 lần,
 cùng conf 0.25 / IoU 0.7, FP32. Latency end-to-end bao gồm detect YOLO ->
-tính 21 đặc trưng rủi ro -> XGBoost predict_proba -> GaussianBlur, phản ánh
+tính 25 đặc trưng rủi ro -> XGBoost predict_proba -> GaussianBlur, phản ánh
 chi phí thực tế. Báo cáo thêm tỉ lệ frame vượt deadline thiết bị biên (mặc
 định 40 ms, tuỳ qua NCKH_EDGE_DEADLINE_MS). Kết quả chỉ đại diện cho máy
 phát triển (CPU), không phải deadline 40 ms của thiết bị edge GPU.
@@ -161,33 +160,13 @@ phát triển (CPU), không phải deadline 40 ms của thiết bị edge GPU.
 - *XGBoost AUC, PR-AUC, Brier, F1 và ECE*: chất lượng risk model trên split
   sequence-disjoint; đây là metric của model, không thay thế metric end-to-end.
   Mô hình runtime được calibrate bằng Isotonic Regression trên OOF
-  sequence-disjoint (lưu tại `models/xgboost_risk_calibrated.joblib`), giúp
+  sequence-disjoint (lưu tại `final_extracted/artifacts/risk_model_calibrated.joblib`), giúp
   xác suất rủi ro gần xác suất thực hơn (ECE/Brier giảm rõ) và được đánh giá
   thêm trên temporal hold-out sequence-disjoint.
 - *Energy/frame* chỉ có ý nghĩa khi đo bằng cảm biến công suất đã hiệu chuẩn.
 
-## Giới hạn và cách diễn giải
 
-1. Detector là detector *person* nên toàn bộ bảo vệ nhạy cảm là proxy; *chỉ dùng dữ liệu person*.
-2. Kết quả detector/tracking trên VisDrone2019-VID-test-dev chỉ có ý nghĩa
-   trong split này; không được gọi là kết quả production hoặc edge GPU.
-3. Latency hiện đo trên CPU. overload-ms=250 là ngưỡng đo cho máy này, không
-   đại diện cho deadline 40 ms của thiết bị edge GPU.
-4. XGBoost có ECE cao, nên risk score chưa phải xác suất được calibration.
-   Logistic Regression hiện có thể đạt AUC/PR-AUC tốt hơn XGBoost trên test.
-5. Pipeline phục vụ dùng cửa sổ quá khứ, trong khi dữ liệu archive huấn luyện
-   được mô tả là có cửa sổ nhìn tới tương lai. Đây là train/serve skew cần sửa
-   khi có lại dữ liệu gốc.
-6. ROI_DETECTION trong benchmark hiện dùng detection toàn frame từ cache; số
-   lần gọi ROI vì vậy không chứng minh mức tiết kiệm GPU thực tế.
-7. ULFR coverage-only không phát hiện trường hợp đã phủ nhưng Re-ID vẫn nhận
-   đúng. Đánh giá riêng tư mạnh hơn cần nhãn hoặc oracle cross-sequence hợp lệ.
-8. Các sequence/frame local có thể trùng với dữ liệu detector dùng để xây model;
-   không dùng chúng để tuyên bố holdout độc lập nếu chưa kiểm tra hash và nguồn
-   phân chia.
-9. Kết quả chỉ hợp lệ cùng data_root, danh sách sequence, frame cap, model,
-   threshold và protocol được ghi trong step6_metrics.json.
 
 ## Kiểm tra nhanh
 
-python -c "import xgboost as xgb; m=xgb.XGBClassifier(); m.load_model('models/xgboost_risk.json'); print(m.n_features_in_)"
+python -c "import xgboost as xgb; m=xgb.XGBClassifier(); m.load_model('final_extracted/artifacts/risk_model.json'); print(m.n_features_in_)"

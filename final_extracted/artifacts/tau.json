@@ -1,0 +1,10 @@
+{
+  "tau": 0.5,
+  "youden_j": null,
+  "auc": null,
+  "n_val": 0,
+  "n_pos_val": 0,
+  "split": "val",
+  "margin": 0.02,
+  "method": "youden_j_val"
+}

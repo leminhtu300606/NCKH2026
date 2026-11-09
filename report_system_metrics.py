@@ -16,8 +16,15 @@ Chạy: python report_system_metrics.py
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 import pandas as pd
 

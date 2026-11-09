@@ -1,0 +1,12 @@
+{
+  "conf_thres": 0.25,
+  "iou_thres": 0.70,
+  "img_size": 1024,
+  "device": "cpu",
+  "half": false,
+  "iou_match_threshold": 0.5,
+  "exclude_occlusion_2": true,
+  "category_person": 1,
+  "max_frames_per_seq": 200,
+  "warmup_frames": 30
+}

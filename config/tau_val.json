@@ -1,14 +1,12 @@
 {
-  "tau": 0.5264542698860168,
-  "method": "target_fpr_oof",
+  "tau": 0.18806509945750452,
+  "method": "target_fpr_val",
   "target_fpr": 0.05,
-  "achieved_tpr": 0.1785872945357619,
-  "achieved_fpr": 0.06067087485001826,
-  "tau_youden": 0.48908647894859314,
-  "youden_j": 0.3704965645076241,
-  "auc": 0.6877960338237694,
-  "pr_auc": 0.10390001567536193,
-  "n_oof": 40589,
-  "n_positive": 2251,
-  "evaluation": "sequence-grouped OOF, causal features"
+  "achieved_tpr": 0.16086708499714775,
+  "achieved_fpr": 0.0923197800039285,
+  "tau_youden": 0.07696429704008015,
+  "youden_j": 0.1795574956779203,
+  "n_val": 6844,
+  "n_positive": 1753,
+  "evaluation": "sequence-disjoint hold-out (val split)"
 }
