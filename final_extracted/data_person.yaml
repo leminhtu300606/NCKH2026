@@ -1,13 +1,7 @@
-path: E:/NCKH2026/kaggle_sim/working
-train: E:/NCKH2026/kaggle_sim/working/privacy_build/train/images
-val: E:/NCKH2026/kaggle_sim/working/privacy_build/val/images
-test: E:/NCKH2026/kaggle_sim/working/privacy_build/test/images
+path: /kaggle/working
+train: /kaggle/working/privacy_build/train/images
+val: /kaggle/working/privacy_build/val/images
+test: /kaggle/working/privacy_build/test/images
 nc: 1
 names:
   0: person
-risk_model:
-  model_json: E:/NCKH2026/final_extracted/artifacts/risk_model.json
-  model_calibrated_joblib: E:/NCKH2026/final_extracted/artifacts/risk_model_calibrated.joblib
-  tau_json: E:/NCKH2026/final_extracted/artifacts/risk_tau.json
-  risk_dataset_csv: E:/NCKH2026/final_extracted/artifacts/risk_dataset.csv
-  norm_stats_json: E:/NCKH2026/final_extracted/artifacts/risk_norm_stats.json

@@ -32,14 +32,5 @@
   "ram_stop_gib": 25.5,
   "auto_resets": 0,
   "completed": true,
-  "chunk_dir": "/kaggle/working/outputs",
-  "risk_model": {
-    "model_json": "E:/NCKH2026/final_extracted/artifacts/risk_model.json",
-    "model_calibrated_joblib": "E:/NCKH2026/final_extracted/artifacts/risk_model_calibrated.joblib",
-    "tau_json": "E:/NCKH2026/final_extracted/artifacts/risk_tau.json",
-    "risk_dataset_csv": "E:/NCKH2026/final_extracted/artifacts/risk_dataset.csv",
-    "norm_stats_json": "E:/NCKH2026/final_extracted/artifacts/risk_norm_stats.json",
-    "feature_count": 25,
-    "feature_schema_version": 2
-  }
+  "chunk_dir": "/kaggle/working/outputs"
 }
