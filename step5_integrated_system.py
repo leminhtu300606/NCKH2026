@@ -21,9 +21,14 @@ import json
 import math
 import os
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+# Tắt cảnh báo spam từ ultralytics/YOLO (không ảnh hưởng kết quả)
+warnings.filterwarnings("ignore", message=".*'half' is deprecated.*")
+warnings.filterwarnings("ignore", message=".*Use 'quantize' instead.*")
 
 import cv2
 import numpy as np
@@ -140,7 +145,7 @@ TRACK_MATCH_THRESH = 0.8
 PROTECT_PADDING = 0.15
 # Cho phép chạy nhanh để so sánh backend mà không sửa code:
 #   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
-DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "pytorch")
+DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "onnx")
 ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "final_extracted/artifacts/yolo26s.onnx"))
 MAX_SEQS = int(os.getenv("NCKH_MAX_SEQS", "0"))  # 0 = tất cả sequence
 MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "200"))
@@ -1321,8 +1326,6 @@ def main() -> None:
         f"warmup_frames={WARMUP_FRAMES}"
     )
 
-    if not WEIGHTS_PATH.exists():
-        raise FileNotFoundError(f"Không tìm thấy mô hình detect: {WEIGHTS_PATH}")
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy mô hình XGBoost: {RISK_MODEL_PATH}")
 
@@ -1332,11 +1335,23 @@ def main() -> None:
     ort_session = None
     ort_input_name = None
 
+    # Chỉ kiểm tra file .pt khi backend là pytorch
+    if backend == "pytorch":
+        if not WEIGHTS_PATH.exists():
+            raise FileNotFoundError(f"Không tìm thấy mô hình detect: {WEIGHTS_PATH}")
+
     if backend == "onnx" and _HAS_ORT and ONNX_MODEL_PATH.exists():
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
         ort_session = ort.InferenceSession(str(ONNX_MODEL_PATH), providers=providers)
         ort_input_name = ort_session.get_inputs()[0].name
-        print(f"[Bước 5] Detector backend: onnx | session: {ONNX_MODEL_PATH} | providers: {providers}")
+        # Lấy kích thước input mà model ONNX yêu cầu (H, W) để đặt IMG_SIZE khớp
+        onnx_input_shape = ort_session.get_inputs()[0].shape
+        if len(onnx_input_shape) >= 4:
+            onnx_h = onnx_input_shape[2]
+            onnx_w = onnx_input_shape[3]
+            if isinstance(onnx_h, int) and isinstance(onnx_w, int) and onnx_h > 0 and onnx_w > 0:
+                IMG_SIZE = max(onnx_h, onnx_w)
+        print(f"[Bước 5] Detector backend: onnx | session: {ONNX_MODEL_PATH} | providers: {providers} | imgsz={IMG_SIZE}")
     elif backend == "onnx":
         print(
             f"[Bước 5] Cảnh báo: onnxruntime không có hoặc không tìm thấy {ONNX_MODEL_PATH}, "
