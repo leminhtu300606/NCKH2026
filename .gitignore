@@ -37,6 +37,14 @@ results/
 results/*.json
 outputs/*.json
 
+# Ngoai luu: cho phep commit ket qua mo hinh trong final_extracted (luu qua Git LFS)
+!final_extracted/**/*.pt
+!final_extracted/**/*.pth
+!final_extracted/**/*.onnx
+!final_extracted/**/*.engine
+!final_extracted/**/*.joblib
+!final_extracted/**/*.csv
+
 # IDE / OS
 .vscode/
 .idea/
