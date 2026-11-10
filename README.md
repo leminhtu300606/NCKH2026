@@ -15,8 +15,10 @@ frame -> YOLO person -> ByteTrack -> 21 features -> XGBoost risk
       -> RiskScheduler (P0-P3/A1-A4) -> blur/pixelate -> verify -> OutputGate
 
 Tracker runtime dùng ultralytics.trackers.byte_tracker.BYTETracker với cấu
-hình trong archive: high/low threshold 0.5/0.1, new-track threshold 0.6,
-buffer 30, match threshold 0.8 và score fusion bật.
+hình: high/low threshold 0.30/0.05, new-track threshold 0.25, match threshold
+0.95, buffer 30 và score fusion bật. Bộ ngưỡng này được chọn trên val
+sequence-disjoint rồi giữ nguyên khi chạy test-dev (xem
+[config/eval_config.json](config/eval_config.json)).
 
 B1 đến B8 là các operating point của cùng pipeline:
 
@@ -67,37 +69,51 @@ Các tuỳ chọn chạy nhanh cho Bước 5 (giới hạn số sequence/frame, 
 
 Kết quả được lưu trong [results/](results/):
 
-- step5: results/system_metrics_unified.csv, results/output_gate_log.json, outputs/protected_video.mp4
+- step5 (deployable): results/system_metrics_system.csv, results/output_gate_log.json, outputs/protected_video.mp4
+- step5 (eval, detect mọi frame): results/system_metrics_eval.csv, results/output_gate_log_eval.json
+- step5 (bản tổng hợp dùng cho báo cáo): results/system_metrics_unified.csv
 - step6: results/hardware_benchmark.csv
 - report: results/system_report.md
 
-Các tham số mặc định của protocol là CPU, imgsz=1024, confidence 0.25,
-IoU 0.5, tối đa 200 frame/sequence, một repetition, warm-up 30 frame và
-loại annotation có occlusion == 2. Đây là benchmark kiến trúc end-to-end,
-không cộng hoặc trộn kết quả từ các thư mục bước riêng lẻ.
+Xem [results/README.md](results/README.md) để biết cấu hình, chính sách đánh
+giá và ngày chạy của từng con số.
+
+Các tham số mặc định của protocol (lấy từ notebook huấn luyện và artifact sinh
+ra từ chính notebook đó) là CPU, imgsz=1024, confidence 0.15, NMS IoU 0.5,
+max_det=1000, chạy toàn bộ frame của tập test (17 sequence, 6635 frame), một
+repetition, warm-up 30 frame và loại annotation có occlusion == 2. Toàn bộ
+tham số nằm trong [config/eval_config.json](config/eval_config.json). Đây là
+benchmark kiến trúc end-to-end, không cộng hoặc trộn kết quả từ các thư mục
+bước riêng lẻ.
 
 Hai script step5_integrated_system.py và step6_hardware_benchmark.py dùng
-IMG_SIZE=1024, confidence 0.25, NMS IoU 0.70 để cân bằng precision/recall
-trên detector người. Bước 5 dùng ByteTrack với high/low/new-track thresholds
-0.10/0.01/0.08, match threshold 0.80 và score fusion bật. Detection và
-tracking precision/recall/F1 được tính độc lập, ghép một-một trong cùng frame
-ở IoU 0.5; chỉ category pedestrian (1) được chấm và annotation occlusion 2
-bị loại. Đây là operating point recall-first: precision có thể giảm, nên cần
-đọc cả hai metric. Bước 5 dùng box ứng viên detector (kèm track khi bỏ qua
-detect) làm vùng blur; IoU coverage được đo trên box trước padding và chỉ trên
-GT ở frame được phát hành. Confidence 0.25 giúp giảm false positive và diện
-tích video bị blur so với ngưỡng rất thấp; không diễn giải coverage conditional
-này như recall chuẩn của detector. PSNR/SSIM chỉ được tính trên frame được
-phát hành (không tính frame bị gate chắn đen) để phản ánh chất lượng vùng che
-thực tế.
-Với cấu hình hiện tại, coverage trên lần chạy 17 sequence là
-0.7073; precision YOLO là 0.0892, và 54.14% frame bị output gate chặn.
-Coverage có điều kiện trên frame phát hành; nếu tính các GT nằm trong frame
-bị chặn đen là được bảo vệ hoàn toàn, effective privacy coverage là 0.9619.
-Phần hiệu quả toàn cục này đến từ việc loại bỏ nhiều frame, không đồng nghĩa
-với video hữu dụng hoặc coverage IoU trên mọi frame.
-Đây là kết quả exploratory vì threshold được chọn từ cùng 17 sequence, không
-phải đánh giá holdout độc lập. Độ phân giải cao hơn làm tăng latency và VRAM.
+IMG_SIZE=1024. Bước 5 dùng ByteTrack với ngưỡng
+high/low/new-track 0.30/0.05/0.25, match threshold 0.95, buffer 30, score
+fusion bật — đồng bộ với confidence detector 0.15 và được chọn trên val
+sequence-disjoint. Detection và tracking precision/recall/F1 được tính độc lập, ghép
+một-một trong cùng frame ở IoU 0.5; chỉ category pedestrian (1) được chấm và
+annotation occlusion 2 bị loại. Đây là operating point recall-first: precision
+có thể giảm, nên cần đọc cả hai metric. Bước 5 dùng box ứng viên detector (kèm
+track khi bỏ qua detect) làm vùng blur; IoU coverage được đo trên box trước
+padding và chỉ trên GT ở frame được phát hành. PSNR/SSIM chỉ được tính trên
+frame được phát hành (không tính frame bị gate chắn đen) để phản ánh chất lượng
+vùng che thực tế.
+
+Các bộ số cũ (sinh với confidence 0.25, IoU 0.7, 200 frame/sequence,
+ByteTrack 0.10/0.01/0.08/0.80) đã được dọn khỏi repo sau khi đồng bộ theo
+notebook/artifact, nên không so sánh trực tiếp với kết quả hiện tại.
+
+Với cấu hình hiện tại (test-dev 17 sequence, 6.635 frame), coverage IoU 0.5
+trên frame phát hành là 0.4182; YOLO precision 0.5183 / recall 0.4887 trên
+frame có detect (recall toàn cục 0.2661 vì chỉ gọi detect 53,8% frame), và
+15,13% frame bị output gate chặn. Coverage có điều kiện trên frame phát hành;
+nếu tính các GT nằm trong frame bị chặn đen là được bảo vệ hoàn toàn,
+effective privacy coverage là 0.6982. Phần hiệu quả toàn cục này đến từ việc
+loại bỏ một phần frame, không đồng nghĩa với video hữu dụng hoặc coverage IoU
+trên mọi frame. Ngưỡng gate 0.35408 được hiệu chuẩn ở mức frame trên val
+sequence-disjoint (7 sequence, 2.846 frame); do isotonic bão hoà ở 0.35408,
+tỷ lệ chặn thực tế là 14,55% thay vì mục tiêu 5%, và không tune trên test-dev.
+Độ phân giải cao hơn làm tăng latency và VRAM.
 Hai script tự chọn cuda:0 khi PyTorch CUDA khả dụng, nếu không sẽ chạy CPU.
 Môi trường Windows/Python 3.12 đã kiểm tra. Cài đặt:
 
@@ -111,23 +127,47 @@ Hoặc dùng install.bat (chọn 1 = CPU, 2 = CUDA).
 
 ### Backend detector (Bước 5)
 
-Hiện Bước 5 chỉ triển khai inference PyTorch. Biến `NCKH_BACKEND` được giữ để
-chọn backend trong tương lai; nếu đặt `onnx` hoặc `openvino` mà chưa triển khai,
-script sẽ in cảnh báo và fallback về PyTorch:
+Bước 5 chạy được cả hai backend:
+
+- `pytorch` (mặc định): dùng `final_extracted/artifacts/yolo26s.pt`.
+- `onnx`: dùng `final_extracted/artifacts/yolo26s.onnx`. Lưu ý model này xuất
+  head thô `(1, 5, 21504)` (nc=1 person, **không NMS trong graph**), nên
+  postprocess trong script phải transpose → lọc conf → un-letterbox → NMS
+  (`cv2.dnn.NMSBoxes`). Bản trước đây giả định output `(1, 300, 6)` nên trả về
+  box rác (conf > 1, toạ độ sai); lỗi này đã được sửa.
 
 ```powershell
 python step5_integrated_system.py                                  # PyTorch (mặc định)
-$env:NCKH_BACKEND="onnx";     python step5_integrated_system.py    # fallback PyTorch (cảnh báo)
-$env:NCKH_BACKEND="openvino"; python step5_integrated_system.py    # fallback PyTorch (cảnh báo)
+$env:NCKH_BACKEND="onnx"; python step5_integrated_system.py        # ONNX Runtime
 ```
 
-Các file ONNX (`final_extracted/artifacts/yolo26s.onnx`) chỉ giữ
-làm tham chiếu cho Bước 6 / xuất mô hình; chưa dùng trực tiếp trong Bước 5.
-Chỉnh nhanh phạm vi đánh giá: `NCKH_MAX_SEQS`, `NCKH_MAX_FRAMES`,
-`NCKH_OUT_METRICS`, `NCKH_OUT_GATE_LOG`.
+Video demo: mặc định bật, ghi ra `outputs/protected_video.mp4` (canvas
+1280x720 vì 17 sequence test có 7 độ phân giải khác nhau). Video demo hiển thị
+khung **đã che (blur)** cho cả frame bị gate chắn, kèm nhãn
+`BLOCKED/RELEASED` và giá trị risk; metric vẫn tính trên frame thật của hệ
+thống (frame bị chắn = đen) nên video không làm sai lệch số liệu.
+
+Biến môi trường điều khiển nhanh: `NCKH_BACKEND`, `NCKH_MAX_SEQS`, `NCKH_MAX_FRAMES` (0 = tất cả), `NCKH_WRITE_VIDEO` (0 = tắt video),
+`NCKH_DEMO_OVERLAY` (0 = ghi đúng output thô, frame bị chắn sẽ đen),
+`NCKH_PROGRESS_EVERY` (số frame giữa 2 dòng log tiến độ, 0 = tắt),
+`NCKH_OUT_METRICS`, `NCKH_OUT_GATE_LOG`, `NCKH_OUT_VIDEO`.
+
+Biến môi trường cho protocol đánh giá:
+
+- `NCKH_TRACK_EVAL=1`: bỏ qua scheduler, detect **mọi frame** để đo
+  MOTA/IDF1/HOTA đúng protocol tracking (mặc định 0 = chế độ triển khai
+  skip-frame + Kalman predict).
+- `NCKH_ORACLE_GATE=1`: bật cổng containment dùng ground-truth; chỉ dùng để
+  tham chiếu upper-bound, mặc định tắt và không dùng trong kết quả deployable.
+- `NCKH_DATA_ROOT`: trỏ sang split khác (ví dụ
+  `visdrone_val/VisDrone2019-VID-val`).
+- `NCKH_SEQ`: lọc danh sách sequence, phân tách bằng dấu phẩy.
+- `NCKH_TRACK_HIGH`, `NCKH_TRACK_LOW`, `NCKH_TRACK_NEW`, `NCKH_TRACK_MATCH`,
+  `NCKH_TRACK_BUFFER`: override ngưỡng ByteTrack khi sweep trên val.
 
 Bước 6 đo latency trên 1 frame thật (1360x765), 100 lần sau warm-up 10 lần,
-cùng conf 0.25 / IoU 0.7, FP32. Latency end-to-end bao gồm detect YOLO ->
+cùng operating point với Bước 5 (đọc từ `config/eval_config.json`: imgsz=1024,
+conf 0.15, IoU 0.5), FP32. Latency end-to-end bao gồm detect YOLO ->
 tính 25 đặc trưng rủi ro -> XGBoost predict_proba -> GaussianBlur, phản ánh
 chi phí thực tế. Báo cáo thêm tỉ lệ frame vượt deadline thiết bị biên (mặc
 định 40 ms, tuỳ qua NCKH_EDGE_DEADLINE_MS). Kết quả chỉ đại diện cho máy
@@ -138,22 +178,48 @@ phát triển (CPU), không phải deadline 40 ms của thiết bị edge GPU.
 - *YOLO detection recall/precision/F1* và *ByteTrack recall/precision/F1*:
   ghép một-một theo frame với ground-truth pedestrian category 1 ở IoU >= 0.5;
   loại annotation occlusion level 2. Không gộp detection và tracking thành một metric.
-- *AP/AP50/AP75/APsmall/APmedium/APlarge/AR và HOTA/DetA/AssA/MOTA/IDF1*:
-  chưa có trong benchmark hiện tại vì evaluator chưa xuất các metric này.
+- *AP50/AP@0.5:0.95*: COCO-style 101-point interpolation trên detection của
+  detector person.
+- *MOTA/MOTP/IDF1/HOTA/DetA/AssA/IDSW/Frag/MT/ML*: tính bằng
+  [TrackEval](https://github.com/JonathonLuiten/TrackEval) — evaluator chính
+  thức của MOTChallenge — trên `target_id` của VisDrone VID. ID chỉ duy nhất
+  trong từng sequence nên đánh giá theo sequence rồi gộp bằng
+  `combine_sequences`. Nếu TrackEval không khả dụng, các metric này ghi `-`
+  (N/A), không ghi 0 giả.
+- *Detection toàn cục*: precision/recall/F1 trên **mọi frame có GT**, kể cả
+  frame scheduler bỏ qua detect; đây là chỉ số trung thực cho chế độ tiết kiệm
+  năng lượng, tách khỏi precision/recall trên frame thực sự gọi detect.
 - *Region recall*: tỷ lệ ground-truth box được hợp các vùng bảo vệ phủ ít nhất
   50% diện tích.
-- Khi cần đo upper-bound, có thể bật B8 recall_first để dùng vùng bảo vệ toàn
-  khung. Đây không phải cấu hình triển khai vì làm mất tính hữu dụng của video.
-- *ULFR*: tỷ lệ frame còn ít nhất một ground-truth box chưa được phủ; thấp hơn
-  là tốt hơn. Đây là coverage-only.
-- *Unsafe release*: frame được phát hành nhưng còn box chưa phủ; đây là
-  coverage-proxy, khác với gate violation.
+- *ULFR (unsafe leak frame rate)*: tỷ lệ frame phát hành còn ít nhất một GT box
+  chưa được che >= 90% trên tổng số frame có GT. Frame bị gate chặn (đen) không
+  tính là hở, nên ULFR là coverage-only và phải đọc cùng block rate.
+- *Unsafe release rate*: tỷ lệ frame released còn GT hở trên số frame released
+  có GT; *unsafe GT boxes* / *leak exposure* là số GT-frame bị hở.
+- *Identity leak rate*: tỷ lệ `target_id` không được bảo vệ ở bất kỳ frame nào;
+  frame bị chặn được tính là bảo vệ hoàn toàn.
 - *TTP p50/p95*: số frame từ lúc identity xuất hiện đến lần đầu được bảo vệ;
-  identity không được bảo vệ là censored.
+  identity không được bảo vệ là censored (báo kèm censored rate).
+- *Blur-area ratio*: trung bình tỷ lệ diện tích frame bị blur (union mask,
+  không double-count) trên frame released.
+- *Over-protection ratio*: `1 - diện tích GT được phủ / diện tích đã blur`;
+  cao hơn nghĩa là blur lan ra ngoài người nhiều, mất utility.
+- *PSNR background / protected*: PSNR giới hạn theo mask nền và mask vùng che.
+  PSNR vùng che thấp hơn là che mạnh hơn; PSNR nền cao là giữ được chi tiết
+  cảnh. Giá trị 100 dB là quy ước khi hai ảnh giống hệt trên mask.
+- *Gate precision/recall/F1, false block rate, leak rate*: coi positive =
+  frame nguy hiểm (nếu phát hành thì hở GT), dự đoán positive = frame bị chặn.
+  Ground-truth chỉ dùng để gán nhãn **sau khi** gate đã quyết định.
+- *Frame-risk ROC-AUC/PR-AUC/Brier/ECE*: calibration của frame risk theo nhãn
+  unsafe ở trên, không phải metric chất lượng model XGBoost trên
+  `risk_dataset.csv`; hai nguồn nhãn không được trộn.
+- Hỗ trợ đo upper-bound: có thể bật B8 recall_first để dùng vùng bảo vệ toàn
+  khung. Đây không phải cấu hình triển khai vì làm mất tính hữu dụng của video.
 - *Calls/100 frames, FPS, p50/p95/p99 latency*: chi phí và thời gian end-to-end
   sau warm-up.
 - *Blocked/correct block/false block/gate violation*: tính đúng của cổng phát
-  hành, tách biệt với chất lượng detector.
+  hành, tách biệt với chất lượng detector. Các metric gate dùng cùng nhãn
+  unsafe như ULFR nên không phụ thuộc decision của gate.
 - *Re-ID attack/protection success, PSNR, SSIM*: hiệu quả và chất lượng vùng
   che khi oracle Re-ID được chạy.
 - Các chỉ số nhận dạng đối tượng khác ngoài người không nằm trong phạm vi đánh giá vì hệ thống chỉ sử dụng dữ liệu *person*.

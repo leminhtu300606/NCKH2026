@@ -7,7 +7,10 @@ Chỉ sử dụng các chỉ số được công nhận trong literature:
 - Risk model: ROC AUC, PR AUC, Accuracy, Precision/Recall/F1, Brier Score, ECE
 - Scheduler/Gate: Detection calls/100 frames, Average detection interval,
   Output gate block rate, Output gate release rate
-- Privacy protection: PSNR (dB), SSIM
+- Privacy protection: PSNR (dB), SSIM, ULFR, unsafe release, TTP,
+  identity leak, blur-area ratio, over-protection ratio, PSNR tách vùng
+- Gate quality: confusion matrix, precision/recall/F1, false block rate,
+  leak rate, ROC-AUC/PR-AUC/Brier/ECE của frame risk
 - End-to-end: Detection Precision/Recall/F1, Latency p50/p95/p99, FPS,
   Detection calls/100 frames
 
@@ -43,10 +46,14 @@ from ultralytics import YOLO
 from metrics_unified import (
     iou,
     containment,
+    iou_matrix,
+    containment_matrix,
     average_precision_coco,
     precision_recall_f1_one_to_one,
     mota_motp,
     expected_calibration_error,
+    privacy_utility_metrics,
+    gate_quality_metrics,
 )
 
 try:
@@ -64,13 +71,14 @@ except Exception:
 WEIGHTS_PATH = Path("final_extracted/artifacts/yolo26s.pt")
 RISK_MODEL_PATH = Path("final_extracted/artifacts/risk_model.json")
 RISK_CALIBRATED_PATH = Path("final_extracted/artifacts/risk_model_calibrated.joblib")
-DATA_ROOT = Path("VisDrone2019-VID-test-dev")
+DATA_ROOT = Path(os.getenv("NCKH_DATA_ROOT", "VisDrone2019-VID-test-dev"))
 SEQUENCES_DIR = DATA_ROOT / "sequences"
 ANNOTATIONS_DIR = DATA_ROOT / "annotations"
-OUT_VIDEO = Path("outputs/protected_video.mp4")
+OUT_VIDEO = Path(os.getenv("NCKH_OUT_VIDEO", "outputs/protected_video.mp4"))
 OUT_GATE_LOG = Path(os.getenv("NCKH_OUT_GATE_LOG", "results/output_gate_log.json"))
 OUT_METRICS = Path(os.getenv("NCKH_OUT_METRICS", "results/system_metrics_unified.csv"))
 COORDINATOR_RULES = Path("config/coordinator_rules.json")
+GATE_THRESHOLD_PATH = Path("config/gate_threshold_val.json")
 TAU_PATH = Path("config/tau_val.json")
 RISK_DATASET_PATH = Path("final_extracted/artifacts/risk_dataset.csv")
 
@@ -130,31 +138,48 @@ def resolve_feature_names(model: Any) -> list[str]:
 
 # Giá trị mặc định; sẽ được override bởi config/eval_config.json trong main()
 # để đảm bảo đồng nhất chỉ số giữa hệ thống và notebook huấn luyện Kaggle.
+# Các giá trị dưới đây lấy đúng theo artifact sinh bởi notebook:
+#   - IMGSZ = 1024 (notebook4234ae1bfe / notebook426604c70d, cell CONFIG)
+#   - conf/iou track = 0.15 / 0.5 (final_extracted/artifacts/track_config.json)
+#   - ByteTrack = final_extracted/bytetrack_person.yaml
+#   - MAX_DET = 1000 (cell CONFIG notebook)
 IMG_SIZE = 1024
-# Ghi video ra file là tùy chọn: tắt mặc định để tránh lỗi FFmpeg
-# "Failed to write frame" trên môi trường không có encoder tương thích.
-# Metrics (PSNR/SSIM) chỉ được tính trên frame ĐÃ PHÁT HÀNH (released), không tính
-# trên frame bị gate chắn (mảng đen) để PSNR/SSIM phản ánh chất lượng vùng che thực tế.
-WRITE_VIDEO = False
-CONF_THRES = 0.25
-IOU_THRES = 0.7
-TRACK_HIGH_THRESH = 0.10
-TRACK_LOW_THRESH = 0.01
-TRACK_NEW_THRESH = 0.08
-TRACK_MATCH_THRESH = 0.8
+# Video demo: bật mặc định (outputs/protected_video.mp4). Tắt bằng
+# NCKH_WRITE_VIDEO=0 hoặc "write_video": false trong config/eval_config.json
+# nếu môi trường không có encoder tương thích.
+WRITE_VIDEO = os.getenv("NCKH_WRITE_VIDEO", "1") == "1"
+CONF_THRES = 0.15
+IOU_THRES = 0.5
+TRACK_HIGH_THRESH = 0.30
+TRACK_LOW_THRESH = 0.05
+TRACK_NEW_THRESH = 0.25
+TRACK_MATCH_THRESH = 0.95
+MAX_DET = 1000
+# Video demo: ghi khung đã che + nhãn BLOCKED/RELEASED (không ảnh hưởng metric).
+DEMO_OVERLAY = os.getenv("NCKH_DEMO_OVERLAY", "1") == "1"
 PROTECT_PADDING = 0.15
 # Cho phép chạy nhanh để so sánh backend mà không sửa code:
-#   NCKH_BACKEND=onnx NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
-DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "onnx")
+#   NCKH_BACKEND=pytorch NCKH_MAX_SEQS=3 NCKH_MAX_FRAMES=40 python step5_integrated_system.py
+# pytorch mặc định vì nhanh hơn ONNX-CPU ở imgsz 1024 trên máy này; đặt
+# NCKH_BACKEND=onnx nếu cần đối chứng backend ONNX.
+DETECTOR_BACKEND = os.getenv("NCKH_BACKEND", "pytorch")
 ONNX_MODEL_PATH = Path(os.getenv("NCKH_ONNX_MODEL", "final_extracted/artifacts/yolo26s.onnx"))
 MAX_SEQS = int(os.getenv("NCKH_MAX_SEQS", "0"))  # 0 = tất cả sequence
-MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "200"))
+MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", "0"))  # 0 = tất cả frame
 WARMUP_FRAMES = 30
+PROGRESS_EVERY = int(os.getenv("NCKH_PROGRESS_EVERY", "25"))  # 0 = tắt log tiến độ
+
+# Chế độ đánh giá tracker: detect MỖI frame để đo MOTA/IDF1/HOTA đúng protocol.
+# Mặc định tắt để giữ hành vi hệ thống thật (skip-frame + lan truyền track).
+TRACK_EVAL = os.getenv("NCKH_TRACK_EVAL", "0") == "1"
+# Cổng output dùng ground-truth (oracle) chỉ để tham chiếu upper-bound.
+# Mặc định tắt: quyết định block không được dùng GT.
+ORACLE_GATE = os.getenv("NCKH_ORACLE_GATE", "0") == "1"
 
 CONF_WINDOW = 5
 PRED_UNCERT_WINDOW = 5
 EWMA_ALPHA = 0.3
-TRACK_BUFFER_FRAMES = 60
+TRACK_BUFFER_FRAMES = 30
 TRUNC_MARGIN_PX = 2
 NEIGHBOR_RADIUS_FRAC = 0.05
 NEIGHBOR_K = 5
@@ -187,16 +212,30 @@ def load_eval_config() -> dict[str, Any]:
     """
     cfg_path = Path("config/eval_config.json")
     default_cfg = {
-        "conf_thres": 0.25,
-        "iou_thres": 0.70,
+        # --- Detector (theo notebook CONFIG + track_config.json) ---
+        "conf_thres": 0.15,
+        "iou_thres": 0.50,
         "img_size": 1024,
+        "max_det": 1000,
         "device": "cpu",
         "half": False,
+        "backend": "pytorch",
+        # --- Protocol đánh giá trên VisDrone (giữ như README/report) ---
         "iou_match_threshold": 0.5,
         "exclude_occlusion_2": True,
         "category_person": 1,
-        "max_frames_per_seq": 200,
+        # 0 = chạy toàn bộ frame của tập test (17 sequence / 6635 frame)
+        "max_frames_per_seq": 0,
         "warmup_frames": 30,
+        # --- ByteTrack (final_extracted/bytetrack_person.yaml) ---
+        "track_high_thresh": 0.30,
+        "track_low_thresh": 0.05,
+        "new_track_thresh": 0.25,
+        "track_match_thresh": 0.95,
+        "track_buffer": 30,
+        # --- Video demo ---
+        "write_video": True,
+        "video_fps": 30.0,
     }
     if cfg_path.exists():
         with cfg_path.open("r", encoding="utf-8") as f:
@@ -247,13 +286,17 @@ def run_onnx_detect(
 ) -> np.ndarray:
     """Chạy inference ONNX detector và trả về detections_np (x1,y1,x2,y2,conf,cls).
 
-    Mô hình ONNX đã xuất từ Ultralytics với output (1, 300, 6) =
-    [cx, cy, w, h, conf, class] trong không gian ảnh gốc (đã un-scale trong graph).
-    Chuyển về [x1, y1, x2, y2] trước khi trả về.
+    Model ONNX (`final_extracted/artifacts/yolo26s.onnx`) xuất ra **head thô**
+    của Ultralytics: (1, 4+nc, N) = (1, 5, 21504) với nc = 1 (person), KHÔNG có
+    NMS nhúng trong graph. Vì vậy phải:
+      1. transpose về (N, 4+nc) = (21504, 5);
+      2. lọc theo conf, đổi cx,cy,w,h -> x1,y1,x2,y2;
+      3. un-letterbox về toạ độ ảnh gốc (trừ padding top/left, chia scale);
+      4. NMS bằng cv2.dnn.NMSBoxes (vector hoá) thay cho vòng lặp Python.
     """
     h, w = frame.shape[:2]
     scale = min(img_size / h, img_size / w)
-    new_h, new_w = int(h * scale), int(w * scale)
+    new_h, new_w = int(round(h * scale)), int(round(w * scale))
     resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     canvas = np.full((img_size, img_size, 3), 114, dtype=np.uint8)
     top = (img_size - new_h) // 2
@@ -265,58 +308,90 @@ def run_onnx_detect(
     blob = np.expand_dims(blob, axis=0)
 
     outputs = ort_session.run(None, {input_name: blob})
-    # Output shape: (1, 300, 6) -> [cx, cy, w, h, conf, class] trong không gian ảnh gốc
-    preds = outputs[0][0]  # (300, 6)
-
-    # Lọc theo conf
-    mask = preds[:, 4] >= conf_thres
-    if not mask.any():
+    raw = np.asarray(outputs[0])
+    if raw.ndim == 3:
+        raw = raw[0]
+    if raw.ndim != 2 or raw.size == 0:
         return np.empty((0, 6), dtype=np.float32)
 
-    dets = preds[mask]
-    cx = dets[:, 0]
-    cy = dets[:, 1]
-    bw = dets[:, 2]
-    bh = dets[:, 3]
-    x1 = np.clip(cx - bw / 2.0, 0, w)
-    y1 = np.clip(cy - bh / 2.0, 0, h)
-    x2 = np.clip(cx + bw / 2.0, 0, w)
-    y2 = np.clip(cy + bh / 2.0, 0, h)
-    confs = dets[:, 4]
-    classes = dets[:, 5]
+    # (4+nc, N) -> (N, 4+nc); nếu model đã xuất (N, 4+nc) thì giữ nguyên.
+    preds = raw.T if raw.shape[0] < raw.shape[1] else raw
+    if preds.shape[1] < 5:
+        return np.empty((0, 6), dtype=np.float32)
 
-    # NMS bổ sung (nếu muốn chặt hơn) - iou_thres dùng để lọc box trùng lặp
-    order = np.argsort(-confs)
-    keep = []
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
-    while order.size > 0:
-        i = order[0]
-        keep.append(i)
-        if order.size == 1:
-            break
-        rest = order[1:]
-        ovr_list = [
-            iou(
-                [boxes_xyxy[i, 0], boxes_xyxy[i, 1], boxes_xyxy[i, 2], boxes_xyxy[i, 3]],
-                [boxes_xyxy[j, 0], boxes_xyxy[j, 1], boxes_xyxy[j, 2], boxes_xyxy[j, 3]],
-            )
-            for j in rest
-        ]
-        ovr = np.array(ovr_list)
-        order = rest[ovr < iou_thres]
+    if preds.shape[1] == 5:
+        # nc = 1: cột thứ 5 chính là confidence của lớp person.
+        confs = preds[:, 4]
+        classes = np.zeros(len(preds), dtype=np.float32)
+    else:
+        # nc > 1: không có objectness (YOLOv8+), conf = max class score.
+        scores = preds[:, 4:]
+        classes = scores.argmax(axis=1).astype(np.float32)
+        confs = scores.max(axis=1)
 
-    det_out = np.stack(
-        [
-            x1[keep],
-            y1[keep],
-            x2[keep],
-            y2[keep],
-            confs[keep],
-            classes[keep],
-        ],
-        axis=1,
+    keep = confs >= float(conf_thres)
+    if not keep.any():
+        return np.empty((0, 6), dtype=np.float32)
+
+    boxes = preds[keep]
+    confs = confs[keep]
+    classes = classes[keep]
+
+    cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = np.clip((cx - bw / 2.0 - left) / scale, 0.0, w)
+    y1 = np.clip((cy - bh / 2.0 - top) / scale, 0.0, h)
+    x2 = np.clip((cx + bw / 2.0 - left) / scale, 0.0, w)
+    y2 = np.clip((cy + bh / 2.0 - top) / scale, 0.0, h)
+
+    widths = x2 - x1
+    heights = y2 - y1
+    valid = (widths > 1.0) & (heights > 1.0)
+    if not valid.any():
+        return np.empty((0, 6), dtype=np.float32)
+    x1, y1, widths, heights = x1[valid], y1[valid], widths[valid], heights[valid]
+    confs, classes = confs[valid], classes[valid]
+
+    # NMS vector hoá: cv2.dnn.NMSBoxes nhận box dạng [x, y, w, h].
+    nms_boxes = np.stack([x1, y1, widths, heights], axis=1).tolist()
+    idx = cv2.dnn.NMSBoxes(
+        nms_boxes, confs.astype(np.float32).tolist(),
+        float(conf_thres), float(iou_thres),
+    )
+    if idx is None or len(idx) == 0:
+        return np.empty((0, 6), dtype=np.float32)
+    idx = np.asarray(idx).reshape(-1)[:MAX_DET]
+
+    det_out = np.column_stack(
+        [x1[idx], y1[idx], x1[idx] + widths[idx], y1[idx] + heights[idx],
+         confs[idx], classes[idx]]
     )
     return det_out.astype(np.float32)
+
+
+def predict_risk_batch(risk_model: Any, X: np.ndarray) -> np.ndarray:
+    """Dự đoán xác suất rủi ro cho cả ma trận đặc trưng (n_samples, n_features).
+
+    Gọi `predict_proba` một lần cho toàn bộ track trong frame thay vì từng
+    track, giảm overhead đáng kể trên frame đông người (VisDrone có thể có
+    hàng chục track/frame).
+    """
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim == 1:
+        X = X.reshape(1, -1)
+    if X.size == 0:
+        return np.empty((0,), dtype=np.float64)
+
+    if isinstance(risk_model, dict) and "model" in risk_model:
+        raw = np.asarray(risk_model["model"].predict_proba(X), dtype=np.float64)[:, 1]
+        cal = risk_model.get("calibrator")
+        if cal is not None and "X_thresholds_" in cal and "y_values_" in cal:
+            raw = np.interp(
+                raw,
+                np.asarray(cal["X_thresholds_"], dtype=np.float64),
+                np.asarray(cal["y_values_"], dtype=np.float64),
+            )
+        return np.clip(raw, 0.0, 1.0)
+    return np.asarray(risk_model.predict_proba(X), dtype=np.float64)[:, 1]
 
 
 def predict_risk(risk_model: Any, X: np.ndarray) -> float:
@@ -325,19 +400,7 @@ def predict_risk(risk_model: Any, X: np.ndarray) -> float:
     Hỗ trợ cả mô hình XGBoost thô và payload đã calibrate
     {'model': XGBClassifier, 'calibrator': _RiskCalibrator, ...}.
     """
-    if isinstance(risk_model, dict) and "model" in risk_model:
-        raw_prob = float(risk_model["model"].predict_proba(X)[0, 1])
-        cal = risk_model.get("calibrator")
-        if cal is not None and "X_thresholds_" in cal and "y_values_" in cal:
-            return float(
-                np.clip(
-                    np.interp(raw_prob, np.asarray(cal["X_thresholds_"]), np.asarray(cal["y_values_"])),
-                    0.0,
-                    1.0,
-                )
-            )
-        return raw_prob
-    return float(risk_model.predict_proba(X)[0, 1])
+    return float(predict_risk_batch(risk_model, X)[0])
 
 
 def load_risk_labels_lookup() -> dict:
@@ -412,24 +475,47 @@ class SequenceStandardizer:
         return out.astype(np.float32)
 
 
-def load_annotations(seq_name: str) -> dict[int, list[list[float]]]:
+def limit_frames(images: list[Path], max_frames: int) -> list[Path]:
+    """Giới hạn số frame/sequence; `max_frames <= 0` nghĩa là lấy toàn bộ."""
+    if max_frames is None or int(max_frames) <= 0:
+        return images
+    return images[: int(max_frames)]
+
+
+def load_annotations_with_ids(
+    seq_name: str,
+) -> tuple[dict[int, list[list[float]]], dict[int, list[int]]]:
+    """Đọc annotation VisDrone, trả về box và `target_id` song song.
+
+    Cột 2 của VisDrone VID là `target_id` (track ID do dataset cung cấp).
+    Trước đây code bỏ qua cột này nên IDF1/HOTA không thể tính đúng. ID 0 là
+    ID hợp lệ; ID chỉ duy nhất trong phạm vi một sequence.
+    """
     ann_path = ANNOTATIONS_DIR / f"{seq_name}.txt"
     gt: dict[int, list[list[float]]] = {}
+    gt_ids: dict[int, list[int]] = {}
     if not ann_path.exists():
-        return gt
+        return gt, gt_ids
     with ann_path.open("r", encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split(",")
             if len(parts) < 10:
                 continue
             frame = int(parts[0])
+            target_id = int(parts[1])
             x, y, w, h = float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
             category = int(parts[7])
             occlusion = int(parts[9])
             if category != 1 or occlusion == 2:
                 continue
             gt.setdefault(frame, []).append([x, y, x + w, y + h])
-    return gt
+            gt_ids.setdefault(frame, []).append(target_id)
+    return gt, gt_ids
+
+
+def load_annotations(seq_name: str) -> dict[int, list[list[float]]]:
+    """Chỉ trả về box (giữ API cũ cho các chỗ không cần track ID)."""
+    return load_annotations_with_ids(seq_name)[0]
 
 
 def expand_box(box: list[float], padding: float, img_w: int, img_h: int) -> list[float]:
@@ -447,8 +533,12 @@ def expand_box(box: list[float], padding: float, img_w: int, img_h: int) -> list
     return [nx1, ny1, nx2, ny2]
 
 
-def blur_boxes(frame: np.ndarray, boxes: list[list[float]]) -> np.ndarray:
-    h, w = frame.shape[:2]
+def boxes_to_mask(boxes: list[list[float]], h: int, w: int) -> np.ndarray:
+    """Rasterize union của các box thành mask uint8 (1 = thuộc vùng che).
+
+    Dùng mask thay vì cộng diện tích từng box để box chồng nhau không bị
+    double-count khi tính `blur_area_ratio` / `over_protection_ratio`.
+    """
     mask = np.zeros((h, w), dtype=np.uint8)
     for box in boxes:
         x1, y1, x2, y2 = [int(v) for v in box]
@@ -457,16 +547,49 @@ def blur_boxes(frame: np.ndarray, boxes: list[list[float]]) -> np.ndarray:
         x2 = max(x1 + 1, min(x2, w))
         y2 = max(y1 + 1, min(y2, h))
         mask[y1:y2, x1:x2] = 1
+    return mask
+
+
+def blur_boxes(
+    frame: np.ndarray,
+    boxes: list[list[float]],
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    h, w = frame.shape[:2]
+    if mask is None:
+        mask = boxes_to_mask(boxes, h, w)
     if not mask.any():
         return frame.copy()
     blurred = cv2.GaussianBlur(frame, (51, 51), 0)
     out = frame.copy()
-    out[mask.astype(bool)] = blurred[mask.astype(bool)]
+    bool_mask = mask.astype(bool)
+    out[bool_mask] = blurred[bool_mask]
     return out
 
 
+def compute_psnr_masked(img1: np.ndarray, img2: np.ndarray, mask: np.ndarray) -> float:
+    """PSNR chỉ trên các pixel thuộc mask (bool, shape HxW).
+
+    Trả NaN nếu mask rỗng. Khi hai ảnh giống hệt nhau trên mask (MSE = 0),
+    trả 100 dB thay vì +inf để trung bình có ý nghĩa (quy ước thường dùng).
+    """
+    if mask is None or not mask.any():
+        return float("nan")
+    diff = img1.astype(np.float32) - img2.astype(np.float32)
+    squared = diff * diff
+    values = squared[mask]
+    mse = float(np.mean(values, dtype=np.float64))
+    if mse <= 0.0:
+        return 100.0
+    return 10.0 * math.log10((255.0 ** 2) / mse)
+
+
 def compute_psnr(img1: np.ndarray, img2: np.ndarray) -> float:
-    mse = np.mean((img1.astype(np.float64) - img2.astype(np.float64)) ** 2)
+    # float32 đủ chính xác cho hiệu ảnh uint8 (giá trị <= 255, bình phương <= 65025
+    # biểu diễn chính xác), còn trung bình được tích luỹ ở float64 -> MSE trùng
+    # khớp với cách tính float64 cũ nhưng nhanh hơn ~2x do ít bộ nhớ hơn.
+    diff = img1.astype(np.float32) - img2.astype(np.float32)
+    mse = float(np.mean(diff * diff, dtype=np.float64))
     if mse == 0:
         return float("inf")
     max_pixel = 255.0
@@ -498,6 +621,9 @@ def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
 def compute_metrics(
     gt_all: dict[str, dict[int, list[list[float]]]],
     pred_all: dict[str, dict[int, list[list[float]]]],
+    pred_ids_all: dict[str, dict[int, list[int]]],
+    pred_scores_all: dict[str, dict[int, list[float]]],
+    gt_ids_all: dict[str, dict[int, list[int]]],
     detector_all: dict[str, dict[int, list[list[float]]]],
     frames_all: dict[str, int],
     latency_samples: list[float],
@@ -512,6 +638,7 @@ def compute_metrics(
     psnr_count: int,
     ssim_sum: float,
     ssim_count: int,
+    per_frame_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     def box_metrics(
         predictions: dict[str, dict[int, list[list[float]] | list[tuple[list[float], float]]]],
@@ -555,6 +682,14 @@ def compute_metrics(
     detection_precision, detection_recall, detection_f1, total_gt, total_pred = box_metrics(
         detector_all, only_predicted_frames=True
     )
+    # Bản toàn cục: mọi frame có GT, kể cả frame scheduler bỏ qua detect.
+    (
+        detection_precision_global,
+        detection_recall_global,
+        detection_f1_global,
+        total_gt_global,
+        total_pred_global,
+    ) = box_metrics(detector_all, only_predicted_frames=False)
     tracking_precision, tracking_recall, tracking_f1, _, total_tracking_pred = box_metrics(
         pred_all
     )
@@ -581,8 +716,28 @@ def compute_metrics(
     )
     ap50_95 = float(np.mean([detection_aps_all.get(t, 0.0) for t in ap_thresholds]))
 
-    # MOTA, MOTP cho tracking (per-frame matching, IDSW = 0 do không có GT track ID)
+    # MOTA/MOTP fallback (per-frame matching). IDF1/HOTA thật lấy từ TrackEval;
+    # nếu TrackEval lỗi thì ghi N/A (NaN), tuyệt đối không ghi 0 giả.
     tracking_mot = mota_motp(gt_all, pred_all)
+    mot_metrics: dict[str, float] = {}
+    try:
+        from mot_eval import evaluate_trackeval
+
+        mot_metrics = evaluate_trackeval(
+            gt_all, gt_ids_all, pred_all, pred_ids_all, pred_scores_all
+        )
+    except Exception as exc:  # pragma: no cover - phụ thuộc môi trường
+        print(f"[Bước 5] Cảnh báo: không chạy được TrackEval: {exc}")
+    if mot_metrics:
+        tracking_mot = {
+            "mota": mot_metrics["mota"],
+            "motp": mot_metrics["motp"],
+        }
+    else:
+        print(
+            "[Bước 5] Cảnh báo: IDF1/HOTA/HOTA không khả dụng -> ghi N/A. "
+            "Kiểm tra trackeval hoặc annotation target_id."
+        )
 
     total_frames = sum(frames_all.values())
     output_gate_block_rate = blocked_frames / max(1, total_frames)
@@ -608,6 +763,11 @@ def compute_metrics(
         "detection_precision": detection_precision,
         "detection_recall": detection_recall,
         "detection_f1": detection_f1,
+        "detection_precision_global": detection_precision_global,
+        "detection_recall_global": detection_recall_global,
+        "detection_f1_global": detection_f1_global,
+        "detection_gt_boxes_global": total_gt_global,
+        "detection_pred_boxes_global": total_pred_global,
         "tracking_precision": tracking_precision,
         "tracking_recall": tracking_recall,
         "tracking_f1": tracking_f1,
@@ -617,6 +777,20 @@ def compute_metrics(
         "detection_ap50_95": ap50_95,
         "tracking_mota": tracking_mot["mota"],
         "tracking_motp": tracking_mot["motp"],
+        "tracking_idf1": mot_metrics.get("idf1", float("nan")),
+        "tracking_idp": mot_metrics.get("idp", float("nan")),
+        "tracking_idr": mot_metrics.get("idr", float("nan")),
+        "tracking_hota": mot_metrics.get("hota", float("nan")),
+        "tracking_deta": mot_metrics.get("deta", float("nan")),
+        "tracking_assa": mot_metrics.get("assa", float("nan")),
+        "tracking_idsw": mot_metrics.get("idsw", float("nan")),
+        "tracking_frag": mot_metrics.get("frag", float("nan")),
+        "tracking_mt": mot_metrics.get("mt", float("nan")),
+        "tracking_ml": mot_metrics.get("ml", float("nan")),
+        "tracking_tp": mot_metrics.get("clr_tp", float("nan")),
+        "tracking_fp": mot_metrics.get("clr_fp", float("nan")),
+        "tracking_fn": mot_metrics.get("clr_fn", float("nan")),
+        "tracking_eval_sequences": mot_metrics.get("mot_eval_sequences", float("nan")),
         "output_gate_block_rate": output_gate_block_rate,
         "output_gate_release_rate": output_gate_release_rate,
         "protect_box_coverage_iou50": protect_box_coverage,
@@ -638,6 +812,14 @@ def compute_metrics(
         "total_pred_boxes": total_pred,
         "total_tracking_pred_boxes": total_tracking_pred,
     }
+
+    # Metric bổ sung từ per-frame records: privacy/utility + gate quality.
+    # Ghi NaN (không ghi 0 giả) khi thiếu dữ liệu, ví dụ checkpoint cũ không
+    # sinh per-frame records.
+    if per_frame_records:
+        metrics.update(privacy_utility_metrics(per_frame_records))
+        metrics.update(gate_quality_metrics(per_frame_records))
+
     return metrics
 
 
@@ -893,19 +1075,56 @@ def decide_roi_padding(risk: float, rules: dict[str, Any]) -> float:
     return max(PROTECT_PADDING, padding)
 
 
+def resolve_gate_threshold(
+    rules: dict[str, Any], tau: float | None = None
+) -> float:
+    """Ngưỡng gate phải nằm cùng không gian xác suất với model runtime.
+
+    Runtime dùng model đã calibrate (isotonic, dải xác suất thực tế ~0..0.354),
+    nên ngưỡng phải được chọn trên chính phân bố frame-risk của split val
+    sequence-disjoint (`config/gate_threshold_val.json`). `tau_val.json` là
+    ngưỡng theo track, dùng trực tiếp ở mức frame (max trên các track) sẽ chặn
+    gần như toàn bộ frame, nên chỉ còn là fallback.
+
+    Thứ tự ưu tiên: `NCKH_GATE_THRESH` > `config/gate_threshold_val.json` >
+    `tau` > `output_gate_block_threshold`.
+    """
+    override = os.getenv("NCKH_GATE_THRESH")
+    if override:
+        return float(override)
+    if GATE_THRESHOLD_PATH.exists():
+        try:
+            payload = json.loads(GATE_THRESHOLD_PATH.read_text(encoding="utf-8"))
+            value = payload.get("threshold")
+            if value is not None:
+                return float(value)
+        except Exception:
+            print(
+                f"[Bước 5] Cảnh báo: không đọc được {GATE_THRESHOLD_PATH}, "
+                "fallback sang tau/config."
+            )
+    if tau is not None:
+        return float(tau)
+    return float(rules.get("output_gate_block_threshold", 0.75))
+
+
+def gate_threshold_source() -> str:
+    if os.getenv("NCKH_GATE_THRESH"):
+        return "env NCKH_GATE_THRESH"
+    if GATE_THRESHOLD_PATH.exists():
+        return "frame-level val calibration"
+    return "tau_val (track-level fallback)"
+
+
 def should_block_output_direct(
     risk: float, rules: dict[str, Any], tau: float | None = None
 ) -> bool:
-    """Chặn frame nếu risk vượt ngưỡng config.
+    """Chặn frame nếu risk vượt ngưỡng gate (xem resolve_gate_threshold).
 
-    `tau` chỉ dùng làm fallback khi config thiếu ngưỡng. Không dùng tau làm
-    gate chính vì OOF tau (0.54) không transfer sang VisDrone test-dev
-    (domain shift): áp tau trực tiếp làm chặn ~47% frame.
+    Không dùng `output_gate_block_threshold` = 0.526 làm mặc định vì giá trị
+    này nằm ngoài dải xác suất calibrated, khiến gate không bao giờ chặn.
     """
-    config_threshold = rules.get("output_gate_block_threshold")
-    if config_threshold is None:
-        config_threshold = tau if tau is not None else 0.75
-    return risk >= float(config_threshold)
+    return risk >= resolve_gate_threshold(rules, tau)
 
 
 def should_block_containment(
@@ -916,16 +1135,79 @@ def should_block_containment(
     """Chặn frame nếu có bất kỳ GT box nào không được protect box chứa đủ mức threshold.
 
     Dùng làm cổng bổ sung để đảm bảo không phát hành frame có người chưa được che.
+    Tính bằng ma trận containment (vectorized) thay cho 2 vòng lặp lồng nhau.
     """
-    for gb in gt_boxes:
-        contained = False
-        for cb in protect_boxes:
-            if containment(gb, cb) >= threshold:
-                contained = True
-                break
-        if not contained:
-            return True
-    return False
+    if not gt_boxes:
+        return False
+    if not protect_boxes:
+        return True
+    mat = containment_matrix(gt_boxes, protect_boxes)
+    return bool((mat.max(axis=1) < float(threshold)).any())
+
+
+VIDEO_CANVAS = (1280, 720)
+
+
+def fit_to_canvas(frame: np.ndarray, canvas_w: int | None = None, canvas_h: int | None = None) -> np.ndarray:
+    """Đưa frame về canvas cố định (giữ tỉ lệ, pad đen).
+
+    VisDrone2019-VID-test-dev có 7 độ phân giải khác nhau (680x382 ... 2720x1530),
+    nên một file video demo duy nhất bắt buộc phải chuẩn hoá kích thước.
+    """
+    canvas_w = VIDEO_CANVAS[0] if canvas_w is None else canvas_w
+    canvas_h = VIDEO_CANVAS[1] if canvas_h is None else canvas_h
+    h, w = frame.shape[:2]
+    scale = min(canvas_w / max(w, 1), canvas_h / max(h, 1))
+    new_w = max(2, int(round(w * scale)))
+    new_h = max(2, int(round(h * scale)))
+    new_w -= new_w % 2
+    new_h -= new_h % 2
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    top = (canvas_h - new_h) // 2
+    left = (canvas_w - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w] = resized
+    return canvas
+
+
+def even_frame(frame: np.ndarray) -> np.ndarray:
+    """Cắt 1 px nếu rộng/cao lẻ.
+
+    mp4v/FFmpeg yêu cầu kích thước chẵn; VisDrone có frame 1360x765 nên nếu
+    không cắt sẽ sinh hàng loạt cảnh báo "Failed to write frame".
+    """
+    h, w = frame.shape[:2]
+    out = frame[: h - (h % 2), : w - (w % 2)]
+    return np.ascontiguousarray(out)
+
+
+def draw_demo_overlay(frame: np.ndarray, block: bool, frame_risk: float, n_protect: int) -> np.ndarray:
+    """Vẽ nhãn trạng thái lên frame demo (không ảnh hưởng metric)."""
+    label = f"BLOCKED  risk={frame_risk:.2f}" if block else f"RELEASED  risk={frame_risk:.2f}"
+    color = (0, 0, 255) if block else (0, 200, 0)
+    cv2.rectangle(frame, (0, 0), (470, 46), (0, 0, 0), -1)
+    cv2.putText(frame, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+    cv2.putText(
+        frame, f"protect_boxes={n_protect}", (10, 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    return frame
+
+
+def tracker_predict_only(tracker: Any) -> np.ndarray:
+    """Lan truyền track qua frame không gọi detect.
+
+    Không được gọi `tracker.update(empty_boxes, frame)`: ByteTracker sẽ đánh
+    dấu toàn bộ `tracked_stracks` thành lost và `_format_output()` trả mảng
+    rỗng, làm mất ID ở mọi frame skip. Ở đây chỉ chạy Kalman predict cho các
+    track đang active, giữ nguyên ID và vị trí dự đoán.
+    """
+    tracker.frame_id += 1
+    stracks = [t for t in tracker.tracked_stracks if t.is_activated]
+    if stracks:
+        tracker.multi_predict(stracks)
+    return tracker._format_output()
 
 
 def run_sequence(
@@ -944,10 +1226,14 @@ def run_sequence(
     ort_input_name: str | None = None,
 ) -> dict[str, Any]:
     seq_dir = SEQUENCES_DIR / seq_name
-    images = sorted(seq_dir.glob("*.jpg"))[:max_frames]
-    gt = load_annotations(seq_name)
+    images = limit_frames(sorted(seq_dir.glob("*.jpg")), max_frames)
+    gt, gt_ids = load_annotations_with_ids(seq_name)
+    seq_wall_start = time.perf_counter()
 
     pred_boxes_by_frame: dict[int, list[list[float]]] = {}
+    pred_ids_by_frame: dict[int, list[int]] = {}
+    pred_scores_by_frame: dict[int, list[float]] = {}
+    gt_ids_by_frame: dict[int, list[int]] = {}
     detector_boxes_by_frame: dict[int, list[list[float]]] = {}
     gt_boxes_by_frame: dict[int, list[list[float]]] = {}
     risks: list[float] = []
@@ -967,6 +1253,8 @@ def run_sequence(
     psnr_count = 0
     ssim_sum = 0.0
     ssim_count = 0
+    # Bản ghi mức frame dùng cho metric privacy/utility + gate quality.
+    per_frame_records: list[dict[str, Any]] = []
 
     frame_idx = 0
     last_detect_frame = -10000
@@ -1016,10 +1304,11 @@ def run_sequence(
         else:
             det_interval = coordinator_rules.get("detect_interval_low", 5)
         should_detect = (
-            frame_idx < WARMUP_FRAMES
+            TRACK_EVAL
+            or frame_idx < WARMUP_FRAMES
             or (frame_idx - last_detect_frame) >= det_interval
         )
-        detection_intervals.append(float(det_interval))
+        detection_intervals.append(1.0 if TRACK_EVAL else float(det_interval))
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -1089,7 +1378,11 @@ def run_sequence(
                     },
                 )()
             else:
-                results = model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=device, half=half, verbose=False)
+                results = model(
+                    frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES,
+                    device=device, max_det=MAX_DET, verbose=False,
+                    **({"half": True} if half else {}),
+                )
                 cpu_boxes = results[0].cpu().boxes
                 xyxy = cpu_boxes.xyxy.numpy()
                 confs = cpu_boxes.conf.numpy()
@@ -1103,21 +1396,9 @@ def run_sequence(
         if should_detect:
             tracker_out = tracker.update(results[0].cpu().boxes, frame)
         else:
-            class _EmptyBoxes:
-                def __init__(self):
-                    self.conf = np.empty((0,), dtype=np.float32)
-                    self.cls = np.empty((0,), dtype=np.float32)
-                    self.xywh = np.empty((0, 4), dtype=np.float32)
-                    self.xywhr = np.empty((0, 5), dtype=np.float32)
-
-                def __getitem__(self, idx):
-                    return _EmptyBoxes()
-
-                def __len__(self):
-                    return 0
-
-            empty_boxes = _EmptyBoxes()
-            tracker_out = tracker.update(empty_boxes, frame)
+            # Không gọi update(empty) vì sẽ đánh lost toàn bộ track (xem
+            # tracker_predict_only). Chỉ predict vị trí cho frame bị skip.
+            tracker_out = tracker_predict_only(tracker)
 
         track_boxes: list[list[float]] = []
         track_confs: list[float] = []
@@ -1162,6 +1443,11 @@ def run_sequence(
         all_boxes_frame = track_boxes
         frame_risk = 0.0
 
+        # Gom đặc trưng của toàn bộ track đang hoạt động trong frame rồi dự đoán
+        # rủi ro 1 lần (batch) thay vì gọi predict_proba cho từng track.
+        # Lưu ý: SequenceStandardizer vẫn cập nhật online tuần tự từng vector
+        # (đúng như lúc train), chỉ phần suy luận model được batch.
+        frame_rows: list[np.ndarray] = []
         for tid, th in track_histories.items():
             if tid not in current_ids:
                 continue
@@ -1177,22 +1463,25 @@ def run_sequence(
             )
 
             X = np.array([feat[f] for f in feature_names], dtype=np.float32)
-            X_norm = risk_standardizer.transform(X).reshape(1, -1)
-            risk_prob = predict_risk(risk_model, X_norm)
+            frame_rows.append(risk_standardizer.transform(X).reshape(-1))
+
+        if frame_rows:
+            probs = predict_risk_batch(risk_model, np.stack(frame_rows))
             # Chỉ ghi nhận cặp (y_true, y_prob) khi có ground truth label khớp
             # theo (sequence, frame) từ risk_dataset.csv.
+            frame_key = (seq_name, frame_idx)
             matched_label: int | None = None
-            if risk_labels_lookup:
-                frame_key = (seq_name, frame_idx)
-                if frame_key in risk_labels_lookup:
-                    # Nếu có bất kỳ artifact track nào trong frame này có label=1,
-                    # coi frame đó là rủi ro (conservative).
-                    matched_label = int(max(risk_labels_lookup[frame_key]))
-            if matched_label is not None:
-                risk_y_true.append(matched_label)
-                risk_y_prob.append(risk_prob)
-            if risk_prob > frame_risk:
-                frame_risk = risk_prob
+            if risk_labels_lookup and frame_key in risk_labels_lookup:
+                # Nếu có bất kỳ artifact track nào trong frame này có label=1,
+                # coi frame đó là rủi ro (conservative).
+                matched_label = int(max(risk_labels_lookup[frame_key]))
+            for risk_prob in probs:
+                risk_prob = float(risk_prob)
+                if matched_label is not None:
+                    risk_y_true.append(matched_label)
+                    risk_y_prob.append(risk_prob)
+                if risk_prob > frame_risk:
+                    frame_risk = risk_prob
 
         risks.append(frame_risk)
         prev_frame_risk_level = classify_risk_level(frame_risk, coordinator_rules)
@@ -1205,9 +1494,11 @@ def run_sequence(
 
         block = should_block_output_direct(frame_risk, coordinator_rules, tau)
 
-        # Cổng bổ sung: chặn nếu có GT box nào chưa được che đủ mức containment.
+        # Cổng bổ sung dùng GT (oracle) CHỈ để tham chiếu upper-bound, không
+        # dùng cho kết quả deployable. Bật bằng NCKH_ORACLE_GATE=1.
         if (
-            not block
+            ORACLE_GATE
+            and not block
             and coordinator_rules.get("enable_containment_gate", False)
         ):
             gts_for_gate = gt.get(frame_number, [])
@@ -1218,40 +1509,100 @@ def run_sequence(
                     coordinator_rules.get("containment_block_threshold", 0.9),
                 )
 
+        # ===== Đo coverage cho MỌI frame =====
+        # `frame_unsafe` = nếu phát hành frame này thì còn GT chưa được che đủ.
+        # Nhãn này chỉ dùng để ĐO (gate quality), không tham gia quyết định gate.
+        gts = gt.get(frame_number, [])
+        gt_ids_frame = gt_ids.get(frame_number, [])
+        iou_cov = (
+            iou_matrix(gts, candidate_boxes)
+            if (gts and candidate_boxes)
+            else np.zeros((len(gts), 0), dtype=np.float64)
+        )
+        cont_cov = (
+            containment_matrix(gts, protect_boxes_frame)
+            if (gts and protect_boxes_frame)
+            else np.zeros((len(gts), 0), dtype=np.float64)
+        )
+        protected_any = (
+            (iou_cov >= 0.5).any(axis=1)
+            if iou_cov.size
+            else np.zeros(len(gts), dtype=bool)
+        )
+        contained_any = (
+            (cont_cov >= 0.9).any(axis=1)
+            if cont_cov.size
+            else np.zeros(len(gts), dtype=bool)
+        )
+        frame_unsafe = bool(len(gts) > 0 and not bool(contained_any.all()))
+
+        # Mask union của vùng che, dùng lại cho blur + đo diện tích.
+        protect_mask = boxes_to_mask(protect_boxes_frame, h, w)
+        blur_area_px = int(cv2.countNonZero(protect_mask))
+        gt_covered_px = 0
+        if gts and blur_area_px > 0:
+            gt_mask = boxes_to_mask(gts, h, w)
+            gt_covered_px = int(cv2.countNonZero(cv2.bitwise_and(gt_mask, protect_mask)))
+
+        psnr_bg = float("nan")
+        psnr_prot = float("nan")
+
         if block:
             blocked += 1
             out_frame = np.zeros_like(frame)
         else:
             released += 1
-            out_frame = blur_boxes(frame, protect_boxes_frame)
-            gts = gt.get(frame_number, [])
-            frame_unsafe = False
-            for gb in gts:
-                total_protect_gt_boxes += 1
-                protected_any = False
-                contained_any = False
-                # IoU coverage: đo trên box detector/tracker TRƯỚC padding,
-                # đúng protocol trong README.
-                for pb in candidate_boxes:
-                    if iou(gb, pb) >= 0.5:
-                        protected_any = True
-                        break
-                # Containment: đo trên box ĐÃ padding (vùng thực sự bị che).
-                for cb in protect_boxes_frame:
-                    if containment(gb, cb) >= 0.9:
-                        contained_any = True
-                        break
-                if protected_any:
-                    protected_gt_boxes += 1
-                if contained_any:
-                    contained_gt_boxes += 1
-                else:
-                    frame_unsafe = True
+            out_frame = blur_boxes(frame, protect_boxes_frame, mask=protect_mask)
+            # GT chỉ dùng để ĐO coverage/unsafe sau khi đã quyết định phát hành.
+            if gts:
+                total_protect_gt_boxes += len(gts)
+                protected_gt_boxes += int(protected_any.sum())
+                contained_gt_boxes += int(contained_any.sum())
             if frame_unsafe:
                 unsafe += 1
+            # PSNR tách vùng: nền (utility) và vùng che (độ mạnh obfuscation).
+            if blur_area_px > 0:
+                psnr_prot = compute_psnr_masked(
+                    frame, out_frame, protect_mask.astype(bool)
+                )
+            if blur_area_px < h * w:
+                psnr_bg = compute_psnr_masked(
+                    frame, out_frame, ~protect_mask.astype(bool)
+                )
+
+        per_frame_records.append(
+            {
+                "sequence": seq_name,
+                "frame_number": int(frame_number),
+                "block": bool(block),
+                "risk": float(frame_risk),
+                "risk_level": str(prev_frame_risk_level),
+                "n_gt": len(gts),
+                "gt_ids": [int(i) for i in gt_ids_frame],
+                "gt_contained": [bool(v) for v in contained_any],
+                "unsafe": bool(frame_unsafe),
+                "blur_area_px": blur_area_px,
+                "frame_area_px": int(h * w),
+                "gt_covered_area_px": gt_covered_px,
+                "psnr_bg": float(psnr_bg),
+                "psnr_prot": float(psnr_prot),
+            }
+        )
 
         if writer is not None:
-            writer.write(out_frame)
+            if DEMO_OVERLAY:
+                # Video demo: luôn ghi khung ĐÃ CHE (blur) kể cả khi gate chắn,
+                # kèm nhãn trạng thái để minh hoạ quyết định của hệ thống.
+                # Metric vẫn tính trên `out_frame` (frame bị chắn = đen) nên
+                # video demo không làm sai lệch số liệu.
+                demo = out_frame if not block else blur_boxes(
+                    frame, protect_boxes_frame, mask=protect_mask
+                )
+                demo = fit_to_canvas(demo)
+                demo = draw_demo_overlay(demo, block, frame_risk, len(protect_boxes_frame))
+                writer.write(demo)
+            else:
+                writer.write(fit_to_canvas(out_frame))
 
         if should_detect:
             detector_boxes_by_frame[frame_number] = [
@@ -1259,7 +1610,10 @@ def run_sequence(
                 for b in detections_np[:, :5].tolist()
             ]
         pred_boxes_by_frame[frame_number] = track_boxes
+        pred_ids_by_frame[frame_number] = track_ids
+        pred_scores_by_frame[frame_number] = track_confs
         gt_boxes_by_frame[frame_number] = gt.get(frame_number, [])
+        gt_ids_by_frame[frame_number] = gt_ids.get(frame_number, [])
 
         # Chỉ đo chất lượng vùng che trên frame ĐÃ PHÁT HÀNH (không tính frame bị chắn đen).
         if not block:
@@ -1283,10 +1637,25 @@ def run_sequence(
         latency_samples.append(latency_ms)
         frame_idx += 1
 
+        # Log tiến độ để không còn cảm giác "treo" (không cần thêm thư viện).
+        if PROGRESS_EVERY > 0 and (frame_idx % PROGRESS_EVERY == 0 or frame_idx == len(images)):
+            _elapsed = time.perf_counter() - seq_wall_start
+            _fps = frame_idx / max(_elapsed, 1e-9)
+            _eta = (len(images) - frame_idx) / max(_fps, 1e-9)
+            print(
+                f"[Bước 5]   {seq_name}: {frame_idx}/{len(images)} frame | "
+                f"{_fps:.2f} fps | {latency_ms:.0f} ms/frame | "
+                f"ETA sequence {_eta / 60.0:.1f} phút",
+                flush=True,
+            )
+
     return {
         "pred_boxes_by_frame": pred_boxes_by_frame,
+        "pred_ids_by_frame": pred_ids_by_frame,
+        "pred_scores_by_frame": pred_scores_by_frame,
         "detector_boxes_by_frame": detector_boxes_by_frame,
         "gt_boxes_by_frame": gt_boxes_by_frame,
+        "gt_ids_by_frame": gt_ids_by_frame,
         "risks": risks,
         "risk_y_true": risk_y_true,
         "risk_y_prob": risk_y_prob,
@@ -1303,11 +1672,27 @@ def run_sequence(
         "psnr_count": psnr_count,
         "ssim_sum": ssim_sum,
         "ssim_count": ssim_count,
+        "per_frame_records": per_frame_records,
     }
+
+
+def _format_metric(value: Any, digits: int = 4) -> str:
+    """Format số cho log, hiển thị N/A khi metric không khả dụng."""
+    try:
+        if value is None:
+            return "N/A"
+        val = float(value)
+        if math.isnan(val):
+            return "N/A"
+        return f"{val:.{digits}f}"
+    except (TypeError, ValueError):
+        return "N/A"
 
 
 def main() -> None:
     global IMG_SIZE, CONF_THRES, IOU_THRES, MAX_FRAMES_PER_SEQ, WARMUP_FRAMES
+    global TRACK_HIGH_THRESH, TRACK_LOW_THRESH, TRACK_NEW_THRESH, TRACK_MATCH_THRESH
+    global TRACK_BUFFER_FRAMES, MAX_DET, WRITE_VIDEO, PROGRESS_EVERY, VIDEO_CANVAS, DEMO_OVERLAY
 
     OUT_VIDEO.parent.mkdir(parents=True, exist_ok=True)
     OUT_GATE_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -1318,18 +1703,39 @@ def main() -> None:
     IMG_SIZE = int(eval_cfg.get("img_size", IMG_SIZE))
     CONF_THRES = float(eval_cfg.get("conf_thres", CONF_THRES))
     IOU_THRES = float(eval_cfg.get("iou_thres", IOU_THRES))
-    MAX_FRAMES_PER_SEQ = int(eval_cfg.get("max_frames_per_seq", MAX_FRAMES_PER_SEQ))
+    MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", eval_cfg.get("max_frames_per_seq", MAX_FRAMES_PER_SEQ)))
     WARMUP_FRAMES = int(eval_cfg.get("warmup_frames", WARMUP_FRAMES))
+    MAX_DET = int(eval_cfg.get("max_det", MAX_DET))
+    # ByteTrack: khớp final_extracted/bytetrack_person.yaml (sinh bởi notebook)
+    TRACK_HIGH_THRESH = float(os.getenv("NCKH_TRACK_HIGH", eval_cfg.get("track_high_thresh", TRACK_HIGH_THRESH)))
+    TRACK_LOW_THRESH = float(os.getenv("NCKH_TRACK_LOW", eval_cfg.get("track_low_thresh", TRACK_LOW_THRESH)))
+    TRACK_NEW_THRESH = float(os.getenv("NCKH_TRACK_NEW", eval_cfg.get("new_track_thresh", TRACK_NEW_THRESH)))
+    TRACK_MATCH_THRESH = float(os.getenv("NCKH_TRACK_MATCH", eval_cfg.get("track_match_thresh", TRACK_MATCH_THRESH)))
+    TRACK_BUFFER_FRAMES = int(os.getenv("NCKH_TRACK_BUFFER", eval_cfg.get("track_buffer", TRACK_BUFFER_FRAMES)))
+    WRITE_VIDEO = bool(eval_cfg.get("write_video", WRITE_VIDEO)) and os.getenv("NCKH_WRITE_VIDEO", "1") == "1"
+    PROGRESS_EVERY = int(os.getenv("NCKH_PROGRESS_EVERY", str(PROGRESS_EVERY)))
     print(
         f"[Bước 5] Eval config: img_size={IMG_SIZE}, conf_thres={CONF_THRES}, "
-        f"iou_thres={IOU_THRES}, max_frames_per_seq={MAX_FRAMES_PER_SEQ}, "
+        f"iou_thres={IOU_THRES}, max_det={MAX_DET}, "
+        f"max_frames_per_seq={MAX_FRAMES_PER_SEQ or 'all'}, "
         f"warmup_frames={WARMUP_FRAMES}"
     )
+    print(
+        f"[Bước 5] ByteTrack: high={TRACK_HIGH_THRESH}, low={TRACK_LOW_THRESH}, "
+        f"new={TRACK_NEW_THRESH}, match={TRACK_MATCH_THRESH}, buffer={TRACK_BUFFER_FRAMES} "
+        f"(đồng bộ conf detector + tune trên val)"
+    )
+    print(
+        f"[Bước 5] Chế độ: track_eval={TRACK_EVAL} "
+        f"({'detect mọi frame' if TRACK_EVAL else 'skip-frame + lan truyền track'}), "
+        f"oracle_gate={ORACLE_GATE}, data_root={DATA_ROOT}"
+    )
+    print(f"[Bước 5] Ghi video demo: {WRITE_VIDEO} -> {OUT_VIDEO}")
 
     if not RISK_MODEL_PATH.exists():
         raise FileNotFoundError(f"Không tìm thấy mô hình XGBoost: {RISK_MODEL_PATH}")
 
-    backend = DETECTOR_BACKEND.lower()
+    backend = os.getenv("NCKH_BACKEND", str(eval_cfg.get("backend", DETECTOR_BACKEND))).lower()
     det_device = DEVICE
     detector_half = False
     ort_session = None
@@ -1396,15 +1802,29 @@ def main() -> None:
             "enable_containment_gate": True,
         }
 
+    gate_threshold = resolve_gate_threshold(coordinator_rules, tau)
+    print(
+        f"[Bước 5] Output gate threshold: {gate_threshold:.4f} "
+        f"({gate_threshold_source()})"
+    )
+
     sequences = sorted(
         [d.name for d in SEQUENCES_DIR.iterdir() if d.is_dir()]
     )
+    seq_filter = [s.strip() for s in os.getenv("NCKH_SEQ", "").split(",") if s.strip()]
+    if seq_filter:
+        sequences = [s for s in sequences if s in seq_filter]
     if MAX_SEQS > 0:
         sequences = sequences[:MAX_SEQS]
 
     all_gt: dict[str, dict[int, list[list[float]]]] = {}
+    all_gt_ids: dict[str, dict[int, list[int]]] = {}
     all_pred: dict[str, dict[int, list[list[float]]]] = {}
+    all_pred_ids: dict[str, dict[int, list[int]]] = {}
+    all_pred_scores: dict[str, dict[int, list[float]]] = {}
     all_detector: dict[str, dict[int, list[list[float]]]] = {}
+    risk_dump_rows: list[tuple[str, int, float]] = []
+    all_frame_records: list[dict[str, Any]] = []
     all_frames: dict[str, int] = {}
     all_risks: dict[str, list[float]] = {}
     all_latency: list[float] = []
@@ -1423,23 +1843,47 @@ def main() -> None:
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = None
+    video_fps = float(eval_cfg.get("video_fps", 30.0))
+    VIDEO_CANVAS = (
+        int(eval_cfg.get("video_width", 1280)),
+        int(eval_cfg.get("video_height", 720)),
+    )
+    if WRITE_VIDEO:
+        writer = cv2.VideoWriter(
+            str(OUT_VIDEO), fourcc, video_fps, VIDEO_CANVAS
+        )
+        if not writer.isOpened():
+            print("[Bước 5] Cảnh báo: không mở được VideoWriter, tắt ghi video.")
+            writer.release()
+            writer = None
+        else:
+            print(
+                f"[Bước 5] Video demo: {OUT_VIDEO} | canvas {VIDEO_CANVAS[0]}x{VIDEO_CANVAS[1]} "
+                f"| {video_fps:.0f} fps"
+            )
+    run_wall_start = time.perf_counter()
+    total_frames_planned = 0
+    for _seq in sequences:
+        total_frames_planned += len(limit_frames(sorted((SEQUENCES_DIR / _seq).glob("*.jpg")), MAX_FRAMES_PER_SEQ))
+    frames_done = 0
+    print(
+        f"[Bước 5] Bắt đầu: {len(sequences)} sequence | {total_frames_planned} frame | "
+        f"backend={backend} | device={det_device}",
+        flush=True,
+    )
 
-    for seq in sequences:
+    for seq_idx, seq in enumerate(sequences, start=1):
         seq_dir = SEQUENCES_DIR / seq
-        images = sorted(seq_dir.glob("*.jpg"))[:MAX_FRAMES_PER_SEQ]
+        images = limit_frames(sorted(seq_dir.glob("*.jpg")), MAX_FRAMES_PER_SEQ)
         if not images:
             continue
 
-        if WRITE_VIDEO and writer is None:
-            first_frame = cv2.imread(str(images[0]))
-            if first_frame is None:
-                continue
-            h, w = first_frame.shape[:2]
-            writer = cv2.VideoWriter(str(OUT_VIDEO), fourcc, 30.0, (w, h))
-            if not writer.isOpened():
-                print("[Bước 5] Cảnh báo: không mở được VideoWriter, tắt ghi video.")
-                writer.release()
-                writer = None
+        seq_start = time.perf_counter()
+        print(
+            f"[Bước 5] [{seq_idx}/{len(sequences)}] {seq}: {len(images)} frame "
+            f"(đã xong {frames_done}/{total_frames_planned} frame)",
+            flush=True,
+        )
 
         result = run_sequence(
             seq, model, risk_model, tau, coordinator_rules, writer,
@@ -1450,8 +1894,26 @@ def main() -> None:
             ort_input_name=ort_input_name,
         )
 
+        frames_done += len(result["pred_boxes_by_frame"])
+        if os.getenv("NCKH_DUMP_RISK"):
+            for _i, _r in enumerate(result["risks"]):
+                risk_dump_rows.append((seq, _i, float(_r)))
+        _seq_elapsed = time.perf_counter() - seq_start
+        _overall_fps = frames_done / max(time.perf_counter() - run_wall_start, 1e-9)
+        _eta_all = (total_frames_planned - frames_done) / max(_overall_fps, 1e-9)
+        print(
+            f"[Bước 5] [{seq_idx}/{len(sequences)}] {seq} xong trong {_seq_elapsed:.1f}s | "
+            f"detection calls={result['detection_calls']} | blocked={result['blocked']} | "
+            f"released={result['released']} | tốc độ chung {_overall_fps:.2f} fps | "
+            f"ETA toàn bộ {_eta_all / 60.0:.1f} phút",
+            flush=True,
+        )
+
         all_gt[seq] = result["gt_boxes_by_frame"]
+        all_gt_ids[seq] = result["gt_ids_by_frame"]
         all_pred[seq] = result["pred_boxes_by_frame"]
+        all_pred_ids[seq] = result["pred_ids_by_frame"]
+        all_pred_scores[seq] = result["pred_scores_by_frame"]
         all_detector[seq] = result["detector_boxes_by_frame"]
         all_frames[seq] = len(result["pred_boxes_by_frame"])
         all_risks[seq] = result["risks"]
@@ -1468,22 +1930,34 @@ def main() -> None:
         total_psnr_count += result["psnr_count"]
         total_ssim_sum += result["ssim_sum"]
         total_ssim_count += result["ssim_count"]
+        all_frame_records.extend(result["per_frame_records"])
 
     if writer is not None:
         writer.release()
 
+    if risk_dump_rows:
+        _dump_path = Path(os.environ["NCKH_DUMP_RISK"])
+        _dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with _dump_path.open("w", newline="", encoding="utf-8") as _f:
+            _w = csv.writer(_f)
+            _w.writerow(["sequence", "frame_index", "frame_risk"])
+            _w.writerows(risk_dump_rows)
+        print(f"[Bước 5] Đã lưu frame risk: {_dump_path} ({len(risk_dump_rows)} frame)")
+
     metrics = compute_metrics(
-        all_gt, all_pred, all_detector, all_frames,
+        all_gt, all_pred, all_pred_ids, all_pred_scores, all_gt_ids, all_detector, all_frames,
         all_latency, total_detection_calls,
         all_intervals, total_blocked, total_released,
         total_protected_gt_boxes, total_contained_gt_boxes, total_protect_gt_boxes,
         total_psnr_sum, total_psnr_count,
         total_ssim_sum, total_ssim_count,
+        all_frame_records,
     )
 
+    policy_name = "integrated_oracle" if ORACLE_GATE else "integrated_deployable"
     rows = []
     for k, v in metrics.items():
-        rows.append({"metric_group": "system", "policy": "integrated", "sequence": "all",
+        rows.append({"metric_group": "system", "policy": policy_name, "sequence": "all",
                      "repetition": 0, "metric_name": k, "metric_value": v})
     df_metrics = pd.DataFrame(rows)
     df_metrics.to_csv(OUT_METRICS, index=False, encoding="utf-8-sig")
@@ -1492,28 +1966,51 @@ def main() -> None:
         "total_blocked": total_blocked,
         "total_released": total_released,
         "total_unsafe": total_unsafe,
+        "gate_mode": "oracle" if ORACLE_GATE else "deployable",
+        "gate_threshold": gate_threshold,
+        "track_eval": TRACK_EVAL,
     }
     with OUT_GATE_LOG.open("w", encoding="utf-8") as f:
         json.dump(gate_log, f, indent=2, ensure_ascii=False)
 
     print(f"[Bước 5] Đã lưu gate log: {OUT_GATE_LOG}")
-    if WRITE_VIDEO and writer is not None:
-        print(f"[Bước 5] Đã lưu video đã che: {OUT_VIDEO}")
+    if WRITE_VIDEO and writer is not None and OUT_VIDEO.exists():
+        print(f"[Bước 5] Đã lưu video demo đã che: {OUT_VIDEO} ({OUT_VIDEO.stat().st_size / 2**20:.1f} MB)")
     else:
         print("[Bước 5] Bỏ qua ghi video (WRITE_VIDEO=False), vẫn tính metric trên frame đã che.")
     print(f"[Bước 5] Đã lưu chỉ số đánh giá: {OUT_METRICS}")
-    print(f"[Bước 5] YOLO precision: {metrics['detection_precision']:.4f}")
-    print(f"[Bước 5] YOLO recall: {metrics['detection_recall']:.4f}")
-    print(f"[Bước 5] YOLO F1: {metrics['detection_f1']:.4f}")
-    print(f"[Bước 5] Tracking precision: {metrics['tracking_precision']:.4f}")
-    print(f"[Bước 5] Tracking recall: {metrics['tracking_recall']:.4f}")
-    print(f"[Bước 5] Tracking F1: {metrics['tracking_f1']:.4f}")
+    print(f"[Bước 5] YOLO precision: {_format_metric(metrics['detection_precision'])}")
+    print(f"[Bước 5] YOLO recall: {_format_metric(metrics['detection_recall'])}")
+    print(f"[Bước 5] YOLO F1: {_format_metric(metrics['detection_f1'])}")
+    print(f"[Bước 5] YOLO recall (toàn cục): {_format_metric(metrics['detection_recall_global'])}")
+    print(f"[Bước 5] Tracking precision: {_format_metric(metrics['tracking_precision'])}")
+    print(f"[Bước 5] Tracking recall: {_format_metric(metrics['tracking_recall'])}")
+    print(f"[Bước 5] Tracking F1: {_format_metric(metrics['tracking_f1'])}")
+    print(f"[Bước 5] Tracking MOTA: {_format_metric(metrics['tracking_mota'])}")
+    print(f"[Bước 5] Tracking MOTP: {_format_metric(metrics['tracking_motp'])}")
+    print(f"[Bước 5] Tracking IDF1: {_format_metric(metrics['tracking_idf1'])}")
+    print(f"[Bước 5] Tracking HOTA: {_format_metric(metrics['tracking_hota'])}")
+    print(f"[Bước 5] Tracking IDSW: {_format_metric(metrics['tracking_idsw'], 0)}")
     print(f"[Bước 5] Protect-box coverage @ IoU 0.5: {metrics['protect_box_coverage_iou50']:.4f}")
     print(f"[Bước 5] Protect-box containment @ 90%: {metrics['protect_box_containment90']:.4f}")
     print(f"[Bước 5] Avg PSNR (dB): {metrics['avg_psnr_db']:.2f}")
     print(f"[Bước 5] Avg SSIM: {metrics['avg_ssim']:.4f}")
     print(f"[Bước 5] Output gate block rate: {metrics['output_gate_block_rate']:.4f}")
     print(f"[Bước 5] Output gate release rate: {metrics['output_gate_release_rate']:.4f}")
+    print(f"[Bước 5] ULFR (unsafe leak frame rate): {_format_metric(metrics.get('ulfr'))}")
+    print(f"[Bước 5] Unsafe release rate: {_format_metric(metrics.get('unsafe_release_rate'))}")
+    print(f"[Bước 5] Identity leak rate: {_format_metric(metrics.get('identity_leak_rate'))}")
+    print(f"[Bước 5] TTP p50/p95 (frames): {_format_metric(metrics.get('ttp_p50_frames'), 1)} / "
+          f"{_format_metric(metrics.get('ttp_p95_frames'), 1)}")
+    print(f"[Bước 5] Blur-area ratio: {_format_metric(metrics.get('blur_area_ratio'))}")
+    print(f"[Bước 5] Over-protection ratio: {_format_metric(metrics.get('over_protection_ratio'))}")
+    print(f"[Bước 5] PSNR background / protected (dB): "
+          f"{_format_metric(metrics.get('psnr_bg_db'), 2)} / "
+          f"{_format_metric(metrics.get('psnr_protected_db'), 2)}")
+    print(f"[Bước 5] Gate precision/recall: {_format_metric(metrics.get('gate_precision'))} / "
+          f"{_format_metric(metrics.get('gate_recall'))}")
+    print(f"[Bước 5] Frame risk ROC-AUC / ECE: {_format_metric(metrics.get('risk_roc_auc'))} / "
+          f"{_format_metric(metrics.get('risk_ece'))}")
     print(f"[Bước 5] Detection calls / 100 frames: {metrics['detection_calls_per_100_frames']:.2f}")
     print(f"[Bước 5] FPS wall: {metrics['fps_wall']:.2f}")
 
