@@ -144,6 +144,8 @@ COUNT_METRICS = [
 
 HARDWARE_LABELS = {
     "detector": "Detector (YOLO)",
+    "blur_full": "Blur full-frame (đối chứng)",
+    "blur_roi": "Blur theo ROI",
     "detect_blur": "Detect + blur",
     "xgboost": "XGBoost risk model",
     "end_to_end": "End-to-end (detect + risk + blur)",
@@ -322,6 +324,20 @@ def main() -> None:
 
     if HARDWARE_CSV.exists():
         hw = pd.read_csv(HARDWARE_CSV)
+        # Ghi rõ cấu hình chạy để không trộn số CPU với số GPU.
+        if "device" in hw.columns:
+            first = hw.iloc[0]
+            lines += [
+                "",
+                "**Cấu hình đo:** "
+                f"device={fmt(first.get('device'), 0)} | "
+                f"GPU={fmt(first.get('gpu_name'), 0)} | "
+                f"torch={fmt(first.get('torch_version'), 0)} "
+                f"(CUDA {fmt(first.get('torch_cuda'), 0)}) | "
+                f"half={first.get('half')} | "
+                f"blur={fmt(first.get('blur_mode'), 0)} "
+                f"(kernel {fmt(first.get('blur_kernel'), 0)})",
+            ]
         lines += ["", "## 4. Hiệu năng phần cứng (Bước 6)", "",
                   "| Component | Mean (ms) | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) | FPS | Deadline miss (%) |",
                   "|---|---|---|---|---|---|---|---|"]

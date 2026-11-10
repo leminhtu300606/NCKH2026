@@ -30,20 +30,47 @@ import torch
 import xgboost as xgb
 from ultralytics import YOLO
 
+from perf_utils import (
+    DEFAULT_BLUR_KERNEL,
+    configure_threads,
+    resolve_device,
+    resolve_half,
+    roi_gaussian_blur,
+    runtime_info,
+    warn_if_cuda_missing,
+)
+
 WEIGHTS_PATH = Path("final_extracted/artifacts/yolo26s.pt")
 RISK_MODEL_PATH = Path("final_extracted/artifacts/risk_model.json")
 OUT_CSV = Path("results/hardware_benchmark.csv")
 
 IMG_SIZE = 1024
-CONF_THRES = 0.25
-IOU_THRES = 0.7
+# Đọc cùng config với Bước 5 để benchmark phần cứng dùng đúng operating point
+# đã huấn luyện (notebook: imgsz=1024, conf/iou từ track_config.json).
+_EVAL_CFG_PATH = Path("config/eval_config.json")
+_EVAL_CFG: dict = {}
+if _EVAL_CFG_PATH.exists():
+    with _EVAL_CFG_PATH.open("r", encoding="utf-8") as _f:
+        _EVAL_CFG = json.load(_f)
+IMG_SIZE = int(_EVAL_CFG.get("img_size", IMG_SIZE))
+CONF_THRES = float(_EVAL_CFG.get("conf_thres", 0.15))
+IOU_THRES = float(_EVAL_CFG.get("iou_thres", 0.5))
+MAX_DET = int(_EVAL_CFG.get("max_det", 1000))
 WARMUP = 10
 MEASURE = 100
 # Deadline xử lý một frame trên thiết bị biên (theo README). 40 ms ~ 25 FPS.
 EDGE_DEADLINE_MS = float(os.getenv("NCKH_EDGE_DEADLINE_MS", "40.0"))
+BLUR_KERNEL = int(os.getenv("NCKH_BLUR_KERNEL", str(DEFAULT_BLUR_KERNEL)))
 
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DEVICE = resolve_device()
+configure_threads()
 print(f"[Bước 6] Sử dụng thiết bị: {DEVICE} (CUDA: {torch.cuda.is_available()})")
+if not torch.cuda.is_available():
+    warn_if_cuda_missing("[Bước 6]")
+print(
+    f"[Bước 6] Blur: ROI (kernel {BLUR_KERNEL}) | cv_threads: {cv2.getNumThreads()} | "
+    f"torch_threads: {torch.get_num_threads()}"
+)
 
 # ===== HỢP ĐỒNG ĐẶC TRƯNG (schema v2) =====
 # 25 đặc trưng khớp với notebook train + step5 runtime.
@@ -243,6 +270,24 @@ def pick_primary_box(detections_np: np.ndarray, w: int, h: int) -> list[float]:
     return [float(v) for v in detections_np[idx, :4]]
 
 
+def tile_area_ratio(boxes: list[list[float]], w: int, h: int, ksize: int) -> float:
+    """Tỷ lệ diện tích frame mà blur ROI thực sự xử lý (box + margin kernel/2).
+
+    Đây là đại lượng quyết định chi phí blur ROI; box chồng nhau không trừ
+    (tỷ lệ là ước lượng, không dùng để tính metric).
+    """
+    half = ksize // 2
+    total = 0
+    for box in boxes:
+        x1, y1, x2, y2 = [int(v) for v in box[:4]]
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
+        total += (min(w, x2 + half) - max(0, x1 - half)) * (min(h, y2 + half) - max(0, y1 - half))
+    return min(1.0, total / float(w * h)) if w > 0 and h > 0 else 0.0
+
+
 def main() -> None:
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
 
@@ -254,25 +299,74 @@ def main() -> None:
     model = YOLO(str(WEIGHTS_PATH))
     model.to(DEVICE)
     det_device = DEVICE
-    det_half = False
-    print(f"[Bước 6] Detector backend: pytorch | device: {DEVICE} | half: {det_half}")
+    det_half = resolve_half("pytorch", det_device)
+    print(
+        f"[Bước 6] Detector backend: pytorch | device: {det_device} | "
+        f"gpu: {runtime_info()['gpu_name']} | half: {det_half} | imgsz: {IMG_SIZE} | "
+        f"conf: {CONF_THRES} | iou: {IOU_THRES} | max_det: {MAX_DET}"
+    )
     risk_model = xgb.XGBClassifier()
     risk_model.load_model(str(RISK_MODEL_PATH))
     feature_names = resolve_feature_names(risk_model)
     print(f"[Bước 6] Risk model dùng {len(feature_names)} đặc trưng (schema v2).")
 
     process = psutil.Process()
-    real_frame = Path("VisDrone2019-VID-test-dev/sequences/uav0000009_03358_v/0000001.jpg")
+    real_frame = Path(
+        os.getenv(
+            "NCKH_BENCH_FRAME",
+            "VisDrone2019-VID-test-dev/sequences/uav0000009_03358_v/0000001.jpg",
+        )
+    )
     if real_frame.exists():
         frame = cv2.imread(str(real_frame))
         print(f"[Bước 6] Dùng frame thật: {real_frame} shape={frame.shape}")
+        bench_frame_path = str(real_frame)
     else:
         rng = np.random.default_rng(42)
         frame = rng.integers(0, 256, size=(720, 1280, 3), dtype=np.uint8)
         print("[Bước 6] Cảnh báo: không tìm thấy frame thật, dùng frame ngẫu nhiên thay thế.")
+        bench_frame_path = "(frame ngẫu nhiên)"
 
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def run_detect():
+        return model(
+            frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES,
+            device=det_device, max_det=MAX_DET, verbose=False,
+            **({"half": True} if det_half else {}),
+        )
+
+    def det_boxes(res) -> np.ndarray:
+        cpu_boxes = res[0].cpu().boxes
+        return cpu_boxes.xyxy.numpy() if len(cpu_boxes.xyxy) else np.empty((0, 4))
+
+    # Frame mặc định có thể không có người -> blur ROI gần như bằng 0 và phép đo
+    # không đại diện. Nếu vậy thử vài frame rải rác trong sequence và chọn frame
+    # đầu tiên có detection. Có thể ép frame bằng NCKH_BENCH_FRAME.
+    if real_frame.exists() and os.getenv("NCKH_BENCH_FRAME") is None and len(det_boxes(run_detect())) == 0:
+        files = sorted(real_frame.parent.glob("*.jpg"))
+        stride = max(1, len(files) // 12)
+        for cand in files[::stride][:12]:
+            if cand.name == real_frame.name:
+                continue
+            alt = cv2.imread(str(cand))
+            if alt is None:
+                continue
+            frame = alt
+            h, w = frame.shape[:2]
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if len(det_boxes(run_detect())) > 0:
+                bench_frame_path = str(cand)
+                print(
+                    f"[Bước 6] Frame mặc định không có detection, dùng {cand} "
+                    f"shape={frame.shape}"
+                )
+                break
+        else:
+            print("[Bước 6] Cảnh báo: không tìm được frame có detection, "
+                  "giữ frame hiện tại; chi phí blur sẽ thấp hơn thực tế.")
+    print(f"[Bước 6] Frame benchmark: {bench_frame_path} shape={frame.shape}")
 
     # Chuẩn bị lịch sử track giả lập (5 frame trước) để tính đặc trưng đại diện.
     primary_box = [w * 0.25, h * 0.25, w * 0.75, h * 0.75]
@@ -283,9 +377,6 @@ def main() -> None:
     det_count_prev = 1
     ewma_det = 1.0
     r_ref = 0.4
-
-    def run_detect():
-        return model(frame, imgsz=IMG_SIZE, conf=CONF_THRES, iou=IOU_THRES, device=det_device, half=det_half, verbose=False)
 
     def run_features(dets):
         box = pick_primary_box(dets, w, h) if len(dets) else primary_box
@@ -306,17 +397,33 @@ def main() -> None:
         X = np.array([feat[f] for f in feature_names], dtype=np.float32).reshape(1, -1)
         return risk_model.predict_proba(X)
 
-    def run_blur():
-        cv2.GaussianBlur(frame, (51, 51), 0)
+    def boxes_for_blur(dets: np.ndarray) -> list[list[float]]:
+        """Box cần che: box detector; nếu không có thì dùng box trung tâm."""
+        if len(dets):
+            return [[float(v) for v in b[:4]] for b in dets]
+        return [list(primary_box)]
+
+    def run_blur_roi(boxes: list[list[float]]):
+        # Đúng như step5: GaussianBlur từng ROI với cùng kernel, không blur toàn frame.
+        roi_gaussian_blur(frame, boxes, ksize=BLUR_KERNEL)
+
+    def run_blur_full():
+        # Cách cũ, chỉ đo để đối chứng chi phí.
+        cv2.GaussianBlur(frame, (BLUR_KERNEL, BLUR_KERNEL), 0)
+
+    # Box mẫu để đo riêng chi phí blur (không lẫn thời gian detect).
+    sample_dets = det_boxes(run_detect())
+    sample_boxes = boxes_for_blur(sample_dets)
+    sample_area_ratio = tile_area_ratio(sample_boxes, w, h, BLUR_KERNEL)
+    sample_box_count = len(sample_dets)
 
     # Warm-up
     for _ in range(WARMUP):
         res = run_detect()
-        cpu_boxes = res[0].cpu().boxes
-        dets = cpu_boxes.xyxy.numpy() if len(cpu_boxes.xyxy) else np.empty((0, 4))
+        dets = det_boxes(res)
         feat = run_features(dets)
         run_xgb(feat)
-        run_blur()
+        run_blur_roi(boxes_for_blur(dets))
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -332,14 +439,30 @@ def main() -> None:
             lat.append((time.perf_counter() - t0) * 1000.0)
         return lat
 
+    def measure_blur_full() -> list[float]:
+        lat = []
+        for _ in range(MEASURE):
+            t0 = time.perf_counter()
+            run_blur_full()
+            lat.append((time.perf_counter() - t0) * 1000.0)
+        return lat
+
+    def measure_blur_roi() -> list[float]:
+        lat = []
+        for _ in range(MEASURE):
+            t0 = time.perf_counter()
+            run_blur_roi(sample_boxes)
+            lat.append((time.perf_counter() - t0) * 1000.0)
+        return lat
+
     def measure_detect_blur() -> list[float]:
         lat = []
         for _ in range(MEASURE):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-            run_detect()
-            run_blur()
+            res = run_detect()
+            run_blur_roi(boxes_for_blur(det_boxes(res)))
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             lat.append((time.perf_counter() - t0) * 1000.0)
@@ -348,9 +471,7 @@ def main() -> None:
     def measure_xgb() -> list[float]:
         # Tính đặc trưng một lần (bên ngoài đo) để chỉ đo chi phí XGBoost.
         res = run_detect()
-        cpu_boxes = res[0].cpu().boxes
-        dets = cpu_boxes.xyxy.numpy() if len(cpu_boxes.xyxy) else np.empty((0, 4))
-        feat = run_features(dets)
+        feat = run_features(det_boxes(res))
         X = np.array([feat[f] for f in feature_names], dtype=np.float32).reshape(1, -1)
         lat = []
         for _ in range(MEASURE):
@@ -366,17 +487,18 @@ def main() -> None:
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
             res = run_detect()
-            cpu_boxes = res[0].cpu().boxes
-            dets = cpu_boxes.xyxy.numpy() if len(cpu_boxes.xyxy) else np.empty((0, 4))
+            dets = det_boxes(res)
             feat = run_features(dets)
             run_xgb(feat)
-            run_blur()
+            run_blur_roi(boxes_for_blur(dets))
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             lat.append((time.perf_counter() - t0) * 1000.0)
         return lat
 
     det_latencies = measure_detector()
+    blur_full_latencies = measure_blur_full()
+    blur_roi_latencies = measure_blur_roi()
     db_latencies = measure_detect_blur()
     risk_latencies = measure_xgb()
     e2e_latencies = measure_end_to_end()
@@ -396,6 +518,8 @@ def main() -> None:
         }
 
     s_det = stats(det_latencies)
+    s_blur_full = stats(blur_full_latencies)
+    s_blur_roi = stats(blur_roi_latencies)
     s_db = stats(db_latencies)
     s_xgb = stats(risk_latencies)
     s_e2e = stats(e2e_latencies)
@@ -411,13 +535,17 @@ def main() -> None:
     od_det = over_deadline(det_latencies)
     od_e2e = over_deadline(e2e_latencies)
 
+    info = runtime_info()
     rows: list[dict[str, Any]] = []
     for name, s in [
         ("detector", s_det),
+        ("blur_full", s_blur_full),
+        ("blur_roi", s_blur_roi),
         ("detect_blur", s_db),
         ("xgboost", s_xgb),
         ("end_to_end", s_e2e),
     ]:
+        od = od_det if name == "detector" else od_e2e
         rows.append({
             "component": name,
             "mean_ms": s["mean_ms"],
@@ -429,8 +557,21 @@ def main() -> None:
             "ram_mb": np.nan,
             "cpu_percent": np.nan,
             "deadline_ms": EDGE_DEADLINE_MS,
-            "pct_over_deadline": od_det["pct_over_deadline"] if name == "detector" else od_e2e["pct_over_deadline"],
-            "over_deadline_count": od_det["over_deadline_count"] if name == "detector" else od_e2e["over_deadline_count"],
+            "pct_over_deadline": od["pct_over_deadline"],
+            "over_deadline_count": od["over_deadline_count"],
+            "device": det_device,
+            "gpu_name": info["gpu_name"],
+            "backend": "pytorch",
+            "half": det_half,
+            "blur_mode": "roi" if name in {"blur_roi", "detect_blur", "end_to_end"} else (
+                "full" if name == "blur_full" else "none"
+            ),
+            "blur_kernel": BLUR_KERNEL,
+            "torch_version": info["torch_version"],
+            "torch_cuda": info["torch_cuda"],
+            "cv_threads": info["cv_threads"],
+            "torch_threads": info["torch_threads"],
+            "blur_area_ratio": sample_area_ratio if name in {"blur_roi", "detect_blur", "end_to_end"} else np.nan,
         })
     rows.append({
         "component": "system",
@@ -445,6 +586,17 @@ def main() -> None:
         "deadline_ms": EDGE_DEADLINE_MS,
         "pct_over_deadline": np.nan,
         "over_deadline_count": np.nan,
+        "device": det_device,
+        "gpu_name": info["gpu_name"],
+        "backend": "pytorch",
+        "half": det_half,
+        "blur_mode": "roi",
+        "blur_kernel": BLUR_KERNEL,
+        "torch_version": info["torch_version"],
+        "torch_cuda": info["torch_cuda"],
+        "cv_threads": info["cv_threads"],
+        "torch_threads": info["torch_threads"],
+        "blur_area_ratio": np.nan,
     })
 
     df = pd.DataFrame(rows)
@@ -452,6 +604,9 @@ def main() -> None:
 
     print(f"[Bước 6] Đã lưu hiệu năng phần cứng: {OUT_CSV}")
     print(f"[Bước 6] Detector mean: {s_det['mean_ms']:.2f} ms, FPS: {s_det['fps']:.2f}")
+    print(f"[Bước 6] Blur full-frame mean: {s_blur_full['mean_ms']:.2f} ms")
+    print(f"[Bước 6] Blur ROI mean: {s_blur_roi['mean_ms']:.2f} ms "
+          f"({sample_box_count} box, {sample_area_ratio * 100:.1f}% diện tích frame)")
     print(f"[Bước 6] Detect+blur mean: {s_db['mean_ms']:.2f} ms, FPS: {s_db['fps']:.2f}")
     print(f"[Bước 6] XGBoost mean: {s_xgb['mean_ms']:.4f} ms, FPS: {s_xgb['fps']:.2f}")
     print(f"[Bước 6] End-to-end mean: {s_e2e['mean_ms']:.2f} ms, FPS: {s_e2e['fps']:.2f}")

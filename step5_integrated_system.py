@@ -55,6 +55,14 @@ from metrics_unified import (
     privacy_utility_metrics,
     gate_quality_metrics,
 )
+from perf_utils import (
+    configure_threads,
+    resolve_device,
+    resolve_half,
+    roi_gaussian_blur,
+    runtime_info,
+    warn_if_cuda_missing,
+)
 
 try:
     import onnxruntime as ort
@@ -141,7 +149,7 @@ def resolve_feature_names(model: Any) -> list[str]:
 # Các giá trị dưới đây lấy đúng theo artifact sinh bởi notebook:
 #   - IMGSZ = 1024 (notebook4234ae1bfe / notebook426604c70d, cell CONFIG)
 #   - conf/iou track = 0.15 / 0.5 (final_extracted/artifacts/track_config.json)
-#   - ByteTrack = final_extracted/bytetrack_person.yaml
+#   - ByteTrack = tune trên val sequence-disjoint (0.30/0.05/0.25/0.95, buffer 30)
 #   - MAX_DET = 1000 (cell CONFIG notebook)
 IMG_SIZE = 1024
 # Video demo: bật mặc định (outputs/protected_video.mp4). Tắt bằng
@@ -186,8 +194,28 @@ NEIGHBOR_K = 5
 CROP_RESIZE = 224
 SSIM_INTERVAL = 5
 
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+# Che khuon mat: blur theo ROI (mac dinh) thay vi blur toan frame.
+#   NCKH_BLUR_MODE=roi   -> chi blur trong tung box (nhanh hon nhieu, ket qua
+#                           trong vung che giong het blur toan frame)
+#   NCKH_BLUR_MODE=full  -> cach cu, de doi chung/kiem tra PSNR
+BLUR_MODE = os.getenv("NCKH_BLUR_MODE", "roi").strip().lower()
+if BLUR_MODE not in {"roi", "full"}:
+    print(
+        f"[Bước 5] Cảnh báo: NCKH_BLUR_MODE='{BLUR_MODE}' không hợp lệ "
+        "(chỉ nhận 'roi' hoặc 'full'), dùng mặc định 'roi'."
+    )
+    BLUR_MODE = "roi"
+BLUR_KERNEL = int(os.getenv("NCKH_BLUR_KERNEL", "51"))
+
+DEVICE = resolve_device()
+configure_threads()
 print(f"[Bước 5] Sử dụng thiết bị: {DEVICE} (CUDA: {torch.cuda.is_available()})")
+if not torch.cuda.is_available():
+    warn_if_cuda_missing("[Bước 5]")
+print(
+    f"[Bước 5] Blur mode: {BLUR_MODE} | kernel: {BLUR_KERNEL} | "
+    f"cv_threads: {cv2.getNumThreads()} | torch_threads: {torch.get_num_threads()}"
+)
 
 
 def load_tau() -> float:
@@ -212,14 +240,14 @@ def load_eval_config() -> dict[str, Any]:
     """
     cfg_path = Path("config/eval_config.json")
     default_cfg = {
-        # --- Detector (theo notebook CONFIG + track_config.json) ---
+        # --- Detector (theo notebook CONFIG, cell 2/13) ---
         "conf_thres": 0.15,
         "iou_thres": 0.50,
         "img_size": 1024,
         "max_det": 1000,
-        "device": "cpu",
-        "half": False,
         "backend": "pytorch",
+        # device/half không đặt ở đây: perf_utils tự chọn cuda:0 khi có CUDA
+        # (NCKH_DEVICE) và tự bật FP16 khi chạy CUDA (NCKH_HALF=0 để tắt).
         # --- Protocol đánh giá trên VisDrone (giữ như README/report) ---
         "iou_match_threshold": 0.5,
         "exclude_occlusion_2": True,
@@ -227,7 +255,7 @@ def load_eval_config() -> dict[str, Any]:
         # 0 = chạy toàn bộ frame của tập test (17 sequence / 6635 frame)
         "max_frames_per_seq": 0,
         "warmup_frames": 30,
-        # --- ByteTrack (final_extracted/bytetrack_person.yaml) ---
+        # --- ByteTrack: tune trên val sequence-disjoint (không phải yaml Kaggle) ---
         "track_high_thresh": 0.30,
         "track_low_thresh": 0.05,
         "new_track_thresh": 0.25,
@@ -236,6 +264,8 @@ def load_eval_config() -> dict[str, Any]:
         # --- Video demo ---
         "write_video": True,
         "video_fps": 30.0,
+        "video_width": 1280,
+        "video_height": 720,
     }
     if cfg_path.exists():
         with cfg_path.open("r", encoding="utf-8") as f:
@@ -560,11 +590,16 @@ def blur_boxes(
         mask = boxes_to_mask(boxes, h, w)
     if not mask.any():
         return frame.copy()
-    blurred = cv2.GaussianBlur(frame, (51, 51), 0)
-    out = frame.copy()
-    bool_mask = mask.astype(bool)
-    out[bool_mask] = blurred[bool_mask]
-    return out
+    if BLUR_MODE == "full":
+        # Cách cũ: blur toàn frame rồi chỉ lấy pixel trong mask (~26 ms/frame
+        # với 1360x765, kernel 51). Giữ lại để đối chứng PSNR.
+        blurred = cv2.GaussianBlur(frame, (BLUR_KERNEL, BLUR_KERNEL), 0)
+        out = frame.copy()
+        bool_mask = mask.astype(bool)
+        out[bool_mask] = blurred[bool_mask]
+        return out
+    # Mặc định: blur từng ROI, cùng kernel, cùng vùng ghi đè.
+    return roi_gaussian_blur(frame, boxes, ksize=BLUR_KERNEL, mask=mask)
 
 
 def compute_psnr_masked(img1: np.ndarray, img2: np.ndarray, mask: np.ndarray) -> float:
@@ -594,6 +629,53 @@ def compute_psnr(img1: np.ndarray, img2: np.ndarray) -> float:
         return float("inf")
     max_pixel = 255.0
     return 10.0 * math.log10((max_pixel ** 2) / mse)
+
+
+def psnr_components(
+    img1: np.ndarray, img2: np.ndarray, mask: np.ndarray
+) -> tuple[float, float, float]:
+    """Tính 1 lần diff, trả về (PSNR toàn frame, PSNR nền, PSNR vùng che).
+
+    Thay cho 3 lần quét toàn frame trước đây (`compute_psnr` + 2 lần
+    `compute_psnr_masked`). Vì `img2` chỉ khác `img1` bên trong `mask`, tổng
+    bình phương sai khác ở nền là 0 và có thể suy ra từ tổng toàn frame.
+
+    Quy ước giữ nguyên như bản cũ:
+    - PSNR toàn frame = +inf khi ảnh giống hệt (caller bỏ qua bằng isfinite).
+    - PSNR trên một vùng = 100 dB khi vùng đó giống hệt.
+    - PSNR nền = NaN khi mask phủ toàn ảnh (không còn pixel nền).
+    """
+    h, w = img1.shape[:2]
+    channels = img1.shape[2] if img1.ndim == 3 else 1
+    total_values = int(h) * int(w) * int(channels)
+
+    mask_bool = mask.astype(bool) if mask is not None else np.zeros((h, w), dtype=bool)
+    diff = img1.astype(np.float32) - img2
+    squared = diff * diff
+
+    if mask_bool.any():
+        protected = squared[mask_bool]
+        ssd_prot = float(np.sum(protected, dtype=np.float64))
+        n_prot = int(protected.size)
+    else:
+        ssd_prot = 0.0
+        n_prot = 0
+    ssd_total = float(np.sum(squared, dtype=np.float64))
+    n_bg = total_values - n_prot
+    ssd_bg = ssd_total - ssd_prot  # chính xác: các số hạng là số nguyên <= 65025
+
+    def _psnr(ssd: float, n: int) -> float:
+        if n <= 0:
+            return float("nan")
+        if ssd <= 0.0:
+            return 100.0
+        mse = ssd / float(n)
+        return 10.0 * math.log10((255.0 ** 2) / mse)
+
+    psnr_full = _psnr(ssd_total, total_values)
+    if ssd_total <= 0.0:
+        psnr_full = float("inf")
+    return psnr_full, _psnr(ssd_bg, n_bg), _psnr(ssd_prot, n_prot)
 
 
 def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
@@ -1560,15 +1642,16 @@ def run_sequence(
                 contained_gt_boxes += int(contained_any.sum())
             if frame_unsafe:
                 unsafe += 1
-            # PSNR tách vùng: nền (utility) và vùng che (độ mạnh obfuscation).
-            if blur_area_px > 0:
-                psnr_prot = compute_psnr_masked(
-                    frame, out_frame, protect_mask.astype(bool)
+            # PSNR: một lần diff cho cả toàn frame / nền / vùng che.
+            try:
+                psnr_full_val, psnr_bg, psnr_prot = psnr_components(
+                    frame, out_frame, protect_mask
                 )
-            if blur_area_px < h * w:
-                psnr_bg = compute_psnr_masked(
-                    frame, out_frame, ~protect_mask.astype(bool)
-                )
+                if math.isfinite(psnr_full_val):
+                    psnr_sum += psnr_full_val
+                    psnr_count += 1
+            except Exception:
+                pass
 
         per_frame_records.append(
             {
@@ -1616,15 +1699,8 @@ def run_sequence(
         gt_ids_by_frame[frame_number] = gt_ids.get(frame_number, [])
 
         # Chỉ đo chất lượng vùng che trên frame ĐÃ PHÁT HÀNH (không tính frame bị chắn đen).
+        # PSNR đã tính ở trên (1 lần diff dùng chung), ở đây chỉ còn SSIM.
         if not block:
-            try:
-                psnr_val = compute_psnr(frame, out_frame)
-                if math.isfinite(psnr_val):
-                    psnr_sum += psnr_val
-                    psnr_count += 1
-            except Exception:
-                pass
-
             if frame_idx % SSIM_INTERVAL == 0:
                 try:
                     ssim_val = compute_ssim(frame, out_frame)
@@ -1706,7 +1782,7 @@ def main() -> None:
     MAX_FRAMES_PER_SEQ = int(os.getenv("NCKH_MAX_FRAMES", eval_cfg.get("max_frames_per_seq", MAX_FRAMES_PER_SEQ)))
     WARMUP_FRAMES = int(eval_cfg.get("warmup_frames", WARMUP_FRAMES))
     MAX_DET = int(eval_cfg.get("max_det", MAX_DET))
-    # ByteTrack: khớp final_extracted/bytetrack_person.yaml (sinh bởi notebook)
+    # ByteTrack: ngưỡng tune trên val sequence-disjoint, đồng bộ conf detector 0.15
     TRACK_HIGH_THRESH = float(os.getenv("NCKH_TRACK_HIGH", eval_cfg.get("track_high_thresh", TRACK_HIGH_THRESH)))
     TRACK_LOW_THRESH = float(os.getenv("NCKH_TRACK_LOW", eval_cfg.get("track_low_thresh", TRACK_LOW_THRESH)))
     TRACK_NEW_THRESH = float(os.getenv("NCKH_TRACK_NEW", eval_cfg.get("new_track_thresh", TRACK_NEW_THRESH)))
@@ -1737,7 +1813,7 @@ def main() -> None:
 
     backend = os.getenv("NCKH_BACKEND", str(eval_cfg.get("backend", DETECTOR_BACKEND))).lower()
     det_device = DEVICE
-    detector_half = False
+    detector_half = resolve_half(backend, det_device)
     ort_session = None
     ort_input_name = None
 
@@ -1747,7 +1823,20 @@ def main() -> None:
             raise FileNotFoundError(f"Không tìm thấy mô hình detect: {WEIGHTS_PATH}")
 
     if backend == "onnx" and _HAS_ORT and ONNX_MODEL_PATH.exists():
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if torch.cuda.is_available() else ["CPUExecutionProvider"]
+        available_providers = list(ort.get_available_providers())
+        if torch.cuda.is_available() and "CUDAExecutionProvider" in available_providers:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        else:
+            providers = ["CPUExecutionProvider"]
+            # Máy có CUDA mà onnxruntime vẫn chỉ có CPU provider -> đang cài bản
+            # onnxruntime CPU, dễ tưởng nhầm là GPU chậm. Chỉ báo khi thật sự
+            # PyTorch thấy CUDA (nếu PyTorch cũng không thấy thì đã cảnh báo ở trên).
+            if torch.cuda.is_available():
+                print(
+                    "[Bước 5] Cảnh báo: onnxruntime không có CUDAExecutionProvider "
+                    f"(đang có: {available_providers}). Cài onnxruntime-gpu và gỡ "
+                    "onnxruntime CPU để dùng GPU cho backend ONNX."
+                )
         ort_session = ort.InferenceSession(str(ONNX_MODEL_PATH), providers=providers)
         ort_input_name = ort_session.get_inputs()[0].name
         # Lấy kích thước input mà model ONNX yêu cầu (H, W) để đặt IMG_SIZE khớp
@@ -1757,7 +1846,11 @@ def main() -> None:
             onnx_w = onnx_input_shape[3]
             if isinstance(onnx_h, int) and isinstance(onnx_w, int) and onnx_h > 0 and onnx_w > 0:
                 IMG_SIZE = max(onnx_h, onnx_w)
-        print(f"[Bước 5] Detector backend: onnx | session: {ONNX_MODEL_PATH} | providers: {providers} | imgsz={IMG_SIZE}")
+        print(
+            f"[Bước 5] Detector backend: onnx | session: {ONNX_MODEL_PATH} | "
+            f"providers yêu cầu: {providers} | providers thực tế: "
+            f"{ort_session.get_providers()} | imgsz={IMG_SIZE}"
+        )
     elif backend == "onnx":
         print(
             f"[Bước 5] Cảnh báo: onnxruntime không có hoặc không tìm thấy {ONNX_MODEL_PATH}, "
@@ -1773,8 +1866,12 @@ def main() -> None:
     model = None
     if backend == "pytorch":
         model = YOLO(str(WEIGHTS_PATH))
-        model.to(DEVICE)
-        print(f"[Bước 5] Detector backend: pytorch | device: {DEVICE} | half: {detector_half}")
+        model.to(det_device)
+        print(
+            f"[Bước 5] Detector backend: pytorch | device: {det_device} | "
+            f"gpu: {runtime_info()['gpu_name']} | half: {detector_half} | "
+            f"imgsz: {IMG_SIZE}"
+        )
 
     risk_model = load_risk_model()
     tau = load_tau()
@@ -1969,6 +2066,13 @@ def main() -> None:
         "gate_mode": "oracle" if ORACLE_GATE else "deployable",
         "gate_threshold": gate_threshold,
         "track_eval": TRACK_EVAL,
+        # Thông tin runtime để báo cáo không trộn số CPU với số GPU.
+        "backend": backend,
+        "device": det_device,
+        "half": detector_half,
+        "blur_mode": BLUR_MODE,
+        "blur_kernel": BLUR_KERNEL,
+        **runtime_info(),
     }
     with OUT_GATE_LOG.open("w", encoding="utf-8") as f:
         json.dump(gate_log, f, indent=2, ensure_ascii=False)

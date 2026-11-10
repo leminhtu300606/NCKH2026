@@ -1,26 +1,49 @@
 # =============================================================================
 # Dependencies CUDA cho hệ thống bảo vệ riêng tư video UAV (NCKH2026)
-# Thay thế requirements.txt khi máy đích có GPU NVIDIA.
+# Dùng thay requirements.txt khi máy đích có GPU NVIDIA.
 # Chạy: pip install -r requirements-cuda.txt
+#
+# QUAN TRỌNG: PyTorch wheel CUDA (+cuXXX) KHÔNG có trên PyPI, phải lấy từ
+# index riêng của PyTorch. Dòng --extra-index-url dưới đây bắt buộc phải có,
+# nếu thiếu thì pip sẽ báo "No matching distribution found for torch==2.15.0+cu124".
+#
+# Chọn chỉ mục khớp driver/CUDA của máy:
+#   cu124 (khuyến nghị, driver >= 550) -> https://download.pytorch.org/whl/cu124
+#   cu121 (driver cũ hơn)              -> https://download.pytorch.org/whl/cu121
+#   cu126 / cu128 (mới nhất)           -> đổi cả URL lẫn hậu tố +cuXXX bên dưới
+#
+# Nếu máy đã lỡ cài bản CPU thì phải gỡ trước, tránh xung đột:
+#   pip uninstall -y torch torchvision onnxruntime
+#   pip install --index-url https://download.pytorch.org/whl/cu124 ^
+#       torch==2.15.0+cu124 torchvision==0.29.2+cu124
+#   pip install -r requirements-cuda.txt
 # =============================================================================
 
-# PyTorch CUDA (tùy theo CUDA đã cài trên máy, ví dụ cu121/cu124):
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-# Ở đây pin bản cu124 làm ví dụ; hãy đổi cho khớp CUDA của máy.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# PyTorch CUDA. Đổi +cu124 -> +cu121 (và URL ở trên) nếu driver cũ.
 torch==2.15.0+cu124
 torchvision==0.29.2+cu124
 
+# Detector YOLO
 ultralytics==8.4.197
+
+# ONNX Runtime GPU (thay cho onnxruntime CPU; phải uninstall onnxruntime trước)
 onnxruntime-gpu==1.31.1
 onnx==1.23.2
 onnxslim==0.1.98
+# OpenVINO dùng cho backend CPU/VPU (không ảnh hưởng CUDA)
 openvino==2026.4.1
 
+# Xử lý ảnh / số liệu
 opencv-python==5.0.0
 numpy==2.5.4
 pandas==3.1.0
 scipy==1.18.1
 
+# Mô hình rủi ro XGBoost + đánh giá metric
 xgboost==3.4.1
 scikit-learn==1.9.1
+
+# Thông tin hệ thống (RAM, CPU)
 psutil==7.2.2

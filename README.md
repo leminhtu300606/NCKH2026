@@ -103,6 +103,30 @@ Các bộ số cũ (sinh với confidence 0.25, IoU 0.7, 200 frame/sequence,
 ByteTrack 0.10/0.01/0.08/0.80) đã được dọn khỏi repo sau khi đồng bộ theo
 notebook/artifact, nên không so sánh trực tiếp với kết quả hiện tại.
 
+### Cấu hình chuẩn (một nguồn duy nhất)
+
+`config/eval_config.json` là nguồn duy nhất cho mọi tham số chạy: cả
+`step5_integrated_system.py` và `step6_hardware_benchmark.py` đều đọc file này.
+Thứ tự ưu tiên: **biến môi trường `NCKH_*` > `config/eval_config.json` >
+default trong code**.
+
+| Tham số | Giá trị | Nguồn |
+|---|---|---|
+| `img_size` | 1024 | notebook CONFIG (cell 2/13) |
+| `conf_thres` / `iou_thres` | 0.15 / 0.5 | notebook CONFIG, chọn trên val |
+| `max_det` | 1000 | notebook CONFIG |
+| `max_frames_per_seq` | 0 = toàn bộ frame | protocol test-dev |
+| ByteTrack high/low/new/match | 0.30 / 0.05 / 0.25 / 0.95 | tune val sequence-disjoint |
+| `track_buffer` | 30 | tune val |
+| `warmup_frames` | 30 | protocol |
+| `device` / `half` | tự chọn khi chạy | `NCKH_DEVICE` / `NCKH_HALF` |
+
+`final_extracted/artifacts/track_config.json` (buffer 45, ladder Kaggle) và
+`final_extracted/bytetrack_person.yaml` (0.35/0.7/45) là artifact lịch sử của
+notebook, **không được đọc lúc chạy**. Muốn đổi ngưỡng thì sửa
+`config/eval_config.json` hoặc dùng `NCKH_TRACK_*`, để tránh hai nguồn cấu hình
+cho ra hai bộ số khác nhau.
+
 Với cấu hình hiện tại (test-dev 17 sequence, 6.635 frame), coverage IoU 0.5
 trên frame phát hành là 0.4182; YOLO precision 0.5183 / recall 0.4887 trên
 frame có detect (recall toàn cục 0.2661 vì chỉ gọi detect 53,8% frame), và
@@ -115,15 +139,32 @@ sequence-disjoint (7 sequence, 2.846 frame); do isotonic bão hoà ở 0.35408,
 tỷ lệ chặn thực tế là 14,55% thay vì mục tiêu 5%, và không tune trên test-dev.
 Độ phân giải cao hơn làm tăng latency và VRAM.
 Hai script tự chọn cuda:0 khi PyTorch CUDA khả dụng, nếu không sẽ chạy CPU.
+**Nếu máy có GPU NVIDIA nhưng cài `requirements.txt` (bản `+cpu`), pipeline sẽ
+chạy CPU và chỉ đạt vài FPS**; từ phiên bản này script in cảnh báo rõ ràng khi
+phát hiện trường hợp đó (`nvidia-smi` có nhưng `torch.cuda.is_available()` False).
 Môi trường Windows/Python 3.12 đã kiểm tra. Cài đặt:
 
+```powershell
 # CPU (mặc định)
 pip install -r requirements.txt
 
-# Hoặc CUDA (GPU NVIDIA, đổi chỉ mục cu124 cho khớp CUDA của máy):
+# GPU NVIDIA: gỡ bản CPU trước, rồi cài torch CUDA + phần còn lại
+pip uninstall -y torch torchvision onnxruntime
+pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.15.0+cu124 torchvision==0.29.2+cu124
 pip install -r requirements-cuda.txt
+```
 
-Hoặc dùng install.bat (chọn 1 = CPU, 2 = CUDA).
+`requirements-cuda.txt` đã có sẵn `--extra-index-url` của PyTorch nên có thể chỉ
+cần `pip install -r requirements-cuda.txt`, nhưng vẫn phải gỡ `torch`,
+`torchvision`, `onnxruntime` bản CPU trước để tránh xung đột. Driver cũ hơn thì
+đổi `cu124` thành `cu121` ở cả URL lẫn tên gói. Kiểm tra sau khi cài:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
+```
+
+Hoặc dùng `install.bat` (chọn 1 = CPU, 2 = CUDA); chọn 2 sẽ tự gỡ bản CPU, cài
+torch CUDA, và dừng với thông báo lỗi nếu `torch.cuda.is_available()` vẫn False.
 
 ### Backend detector (Bước 5)
 
@@ -167,11 +208,13 @@ Biến môi trường cho protocol đánh giá:
 
 Bước 6 đo latency trên 1 frame thật (1360x765), 100 lần sau warm-up 10 lần,
 cùng operating point với Bước 5 (đọc từ `config/eval_config.json`: imgsz=1024,
-conf 0.15, IoU 0.5), FP32. Latency end-to-end bao gồm detect YOLO ->
+conf 0.15, IoU 0.5). Precision là FP32 trên CPU và FP16 khi chạy CUDA (mặc định,
+tắt bằng `NCKH_HALF=0`); cấu hình thực tế được in ra và ghi vào CSV.
+Latency end-to-end bao gồm detect YOLO ->
 tính 25 đặc trưng rủi ro -> XGBoost predict_proba -> GaussianBlur, phản ánh
 chi phí thực tế. Báo cáo thêm tỉ lệ frame vượt deadline thiết bị biên (mặc
 định 40 ms, tuỳ qua NCKH_EDGE_DEADLINE_MS). Kết quả chỉ đại diện cho máy
-phát triển (CPU), không phải deadline 40 ms của thiết bị edge GPU.
+đang chạy, không phải deadline 40 ms của thiết bị edge GPU.
 
 ### Chỉ số
 
@@ -232,6 +275,60 @@ phát triển (CPU), không phải deadline 40 ms của thiết bị edge GPU.
 - *Energy/frame* chỉ có ý nghĩa khi đo bằng cảm biến công suất đã hiệu chuẩn.
 
 
+
+## Hiệu năng và tăng tốc
+
+### Thay đổi trong pipeline
+
+1. **Che theo ROI thay vì blur toàn frame.** `blur_boxes` (Bước 5) và
+   `step6_hardware_benchmark.py` dùng `perf_utils.roi_gaussian_blur`: cắt từng
+   cửa sổ `box + kernel/2`, ghép thành mosaic, gọi `cv2.GaussianBlur` **một
+   lần**, rồi dán phần trong box trở lại. Kết quả **giống hệt từng pixel** so
+   với blur toàn frame (cùng kernel 51, cùng vùng ghi đè) nên PSNR/SSIM/coverage
+   không đổi; chỉ chi phí CPU giảm. Nếu frame quá đông (tổng diện tích cửa sổ
+   > 60% frame) code tự fallback về blur toàn frame.
+2. **FP16 khi chạy CUDA.** `NCKH_HALF` mặc định bật với backend PyTorch trên
+   CUDA; `config/eval_config.json` vẫn ghi `half=false` nhưng không còn bị
+   hardcode. Tắt bằng `NCKH_HALF=0`.
+3. **PSNR một lần diff.** Trước đây mỗi frame quét toàn ảnh 3 lần (PSNR toàn
+   frame + PSNR nền + PSNR vùng che). Nay `psnr_components` tính một lần rồi
+   suy ra cả ba; định nghĩa metric không đổi.
+4. **Không còn âm thầm chạy CPU.** Bước 5/6 in cảnh báo to kèm lệnh sửa khi có
+   `nvidia-smi` nhưng `torch.cuda.is_available()` là False, và ghi
+   device/GPU/precision/backend vào `results/output_gate_log*.json`.
+5. **Bước 6 ghi thêm cột** `device`, `gpu_name`, `backend`, `half`,
+   `blur_mode`, `blur_kernel`, `torch_version`, `torch_cuda`, `cv_threads`,
+   `torch_threads`, `blur_area_ratio`, và đo thêm hai thành phần `blur_full`
+   (cách cũ) và `blur_roi` (cách mới) để so sánh trực tiếp.
+
+### Biến môi trường
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `NCKH_DEVICE` | tự chọn | Ép thiết bị, ví dụ `cpu`, `cuda:0` |
+| `NCKH_HALF` | bật khi CUDA + PyTorch | `1`/`0` bật/tắt FP16 |
+| `NCKH_BLUR_MODE` | `roi` | `full` để chạy lại cách cũ khi đối chứng |
+| `NCKH_BLUR_KERNEL` | `51` | Kích thước kernel Gaussian |
+| `NCKH_CV_THREADS` | mặc định OpenCV | Số thread OpenCV (0 = tuần tự) |
+| `NCKH_TORCH_THREADS` | mặc định PyTorch | Số thread PyTorch; khi CUDA tự giới hạn ≤ 8 |
+| `NCKH_BENCH_FRAME` | frame đầu sequence | Frame dùng cho Bước 6 |
+| `NCKH_WRITE_VIDEO` | `1` | `0` để tắt ghi video khi benchmark |
+
+### Cách đối chứng chất lượng sau khi tối ưu
+
+```powershell
+# 1) Đo hiệu năng: ý nghĩa blur_full vs blur_roi, detect_blur, end_to_end
+python step6_hardware_benchmark.py
+
+# 2) Chạy Bước 5 với blur ROI (mặc định) rồi với blur toàn frame, cùng subset
+$env:NCKH_MAX_SEQS="2"; $env:NCKH_WRITE_VIDEO="0"
+$env:NCKH_OUT_METRICS="results/system_metrics_roi.csv"; python step5_integrated_system.py
+$env:NCKH_BLUR_MODE="full"; $env:NCKH_OUT_METRICS="results/system_metrics_full.csv"; python step5_integrated_system.py
+```
+
+Hai lần chạy phải cho detection/tracking/coverage trùng nhau; `psnr_protected_db`
+và `avg_psnr_db` lệch 0 (cùng phép blur). Nếu lệch, kiểm tra `NCKH_BLUR_KERNEL`
+ở hai lần chạy.
 
 ## Kiểm tra nhanh
 
