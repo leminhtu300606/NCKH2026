@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 chcp 65001 >nul
 setlocal
 echo ================================================================
@@ -27,8 +27,7 @@ if errorlevel 1 goto :error
 echo.
 echo [2/4] Go ban CPU/khac de tranh xung dot...
 echo    - torch/torchvision ban CPU lam torch.cuda.is_available luon bang False
-echo    - onnxruntime ban CPU dung chung thu muc voi onnxruntime-gpu
-python -m pip uninstall -y torch torchvision onnxruntime onnxruntime-gpu
+python -m pip uninstall -y torch torchvision
 
 echo.
 echo [3/4] Cai PyTorch CUDA (cu124)...
@@ -55,7 +54,7 @@ if errorlevel 1 goto :error
 
 echo.
 echo [3/3] Kiem tra cac thu vien can thiet...
-python -c "import torch, cv2, numpy, pandas, ultralytics, onnxruntime, xgboost, psutil, sklearn; print('Tat ca thu vien da san sang.'); print('torch:', torch.__version__, '| CUDA:', torch.cuda.is_available())"
+python -c "import torch, cv2, numpy, pandas, ultralytics, openvino, xgboost, psutil, sklearn; print('Tat ca thu vien da san sang.'); print('torch:', torch.__version__, '| CUDA:', torch.cuda.is_available())"
 if errorlevel 1 goto :error
 goto :done
 
@@ -64,7 +63,7 @@ echo.
 echo ================================================================
 echo  Kiem tra CUDA
 echo ================================================================
-python -c "import torch, cv2, numpy, pandas, ultralytics, onnxruntime, xgboost, psutil, sklearn; print('Tat ca thu vien da san sang.'); print('torch:', torch.__version__, '| torch.version.cuda:', torch.version.cuda, '| CUDA available:', torch.cuda.is_available())"
+python -c "import torch, cv2, numpy, pandas, ultralytics, openvino, xgboost, psutil, sklearn; print('Tat ca thu vien da san sang.'); print('torch:', torch.__version__, '| torch.version.cuda:', torch.version.cuda, '| CUDA available:', torch.cuda.is_available())"
 if errorlevel 1 goto :error
 python -c "import sys, torch; ok = torch.cuda.is_available(); print('GPU:', torch.cuda.get_device_name(0) if ok else 'N/A'); sys.exit(0 if ok else 1)"
 if errorlevel 1 goto :cuda_error
@@ -72,7 +71,7 @@ if errorlevel 1 goto :cuda_error
 :done
 echo.
 echo ================================================================
-echo  Hoan tat. Co the chay: python step5_integrated_system.py
+echo  Hoan tat. Co the chay: python run_pipeline.py all
 echo ================================================================
 pause
 exit /b 0
@@ -96,3 +95,4 @@ echo  LOI: mot buoc cai dat that bai (xem thong bao phia tren).
 echo ################################################################
 pause
 exit /b 1
+

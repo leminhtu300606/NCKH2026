@@ -1,7 +1,0 @@
-path: /kaggle/working
-train: /kaggle/working/privacy_build/train/images
-val: /kaggle/working/privacy_build/val/images
-test: /kaggle/working/privacy_build/test/images
-nc: 1
-names:
-  0: person

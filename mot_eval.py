@@ -12,9 +12,14 @@ Quy ước:
 - GT dùng `target_id` của VisDrone (cột 2 trong annotation), class = 1.
 - Prediction dùng ByteTrack `track_id`.
 - `BENCHMARK='MOT15'` + `DO_PREPROC=False`: bỏ qua preprocessing distractor
-  của MOTChallenge (dữ liệu đã được lọc person + occlusion level 2 từ trước),
-  tránh việc TrackEval loại thêm box vì cột visibility.
+  của MOTChallenge (dữ liệu đã được lọc theo protocol của hệ thống: person
+  category 1+2 như notebook4234ae1bfe, không lọc occlusion), tránh việc
+  TrackEval loại thêm box vì cột visibility.
 - Frame được dời về dải 1..N nếu dữ liệu bắt đầu từ 0.
+
+Đây là **nguồn duy nhất** cho MOTA/MOTP/IDF1/HOTA/IDSW/Frag của hệ thống.
+`step5_integrated_system.py` không còn nhánh tính per-frame dự phòng: nếu
+TrackEval lỗi thì các cột tracking ghi N/A (NaN) và in cảnh báo.
 """
 
 from __future__ import annotations

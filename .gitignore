@@ -15,8 +15,6 @@ venv/
 *.onnx
 *.engine
 *.joblib
-# Ngoai tru: theo doi ONNX model xuat ra trong zip_extract_full/artifacts
-!zip_extract_full/artifacts/yolo26s.onnx
 # Model artifacts (khong commit weights/khu bau mo hinh)
 models/*.json
 
@@ -33,7 +31,8 @@ outputs/
 results/
 *.mp4
 *.csv
-# Bo quasar JSON kết quả tạo ra, nhưng GIU config/*.json (tau_val.json, coordinator_rules.json)
+# Cau hinh duy nhat cua du an nam trong CONFIG (step5_integrated_system.py).
+# Thu muc config/ va core/ cu da bi xoa.
 results/*.json
 outputs/*.json
 
@@ -41,9 +40,13 @@ outputs/*.json
 !final_extracted/**/*.pt
 !final_extracted/**/*.pth
 !final_extracted/**/*.onnx
-!final_extracted/**/*.engine
 !final_extracted/**/*.joblib
 !final_extracted/**/*.csv
+
+# TensorRT engine gan voi GPU + phien ban TensorRT + driver cua may xuat
+# -> moi may phai tu xuat lai, KHONG commit.
+final_extracted/**/*.engine
+*.engine
 
 # IDE / OS
 .vscode/

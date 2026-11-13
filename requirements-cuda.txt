@@ -13,7 +13,7 @@
 #   cu126 / cu128 (mới nhất)           -> đổi cả URL lẫn hậu tố +cuXXX bên dưới
 #
 # Nếu máy đã lỡ cài bản CPU thì phải gỡ trước, tránh xung đột:
-#   pip uninstall -y torch torchvision onnxruntime
+#   pip uninstall -y torch torchvision
 #   pip install --index-url https://download.pytorch.org/whl/cu124 ^
 #       torch==2.15.0+cu124 torchvision==0.29.2+cu124
 #   pip install -r requirements-cuda.txt
@@ -28,12 +28,11 @@ torchvision==0.29.2+cu124
 # Detector YOLO
 ultralytics==8.4.197
 
-# ONNX Runtime GPU (thay cho onnxruntime CPU; phải uninstall onnxruntime trước)
-onnxruntime-gpu==1.31.1
+# OpenVINO (detector duy nhất của dự án)
+openvino==2026.4.1
+# Công cụ export OpenVINO từ checkpoint gốc (không cần khi chỉ chạy inference)
 onnx==1.23.2
 onnxslim==0.1.98
-# OpenVINO dùng cho backend CPU/VPU (không ảnh hưởng CUDA)
-openvino==2026.4.1
 
 # Xử lý ảnh / số liệu
 opencv-python==5.0.0
@@ -44,6 +43,8 @@ scipy==1.18.1
 # Mô hình rủi ro XGBoost + đánh giá metric
 xgboost==3.4.1
 scikit-learn==1.9.1
+# MOT metrics (MOTA/MOTP/IDF1/HOTA) - nguồn duy nhất, không có fallback per-frame
+trackeval==1.3.0
 
 # Thông tin hệ thống (RAM, CPU)
 psutil==7.2.2
